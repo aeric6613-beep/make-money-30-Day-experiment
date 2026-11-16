@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Revenue Dashboard | ToolPipe</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #0b1020; color: #e8edf8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; padding: 32px 18px; }
+    main { width: min(940px, 100%); margin: 0 auto; }
+    h1 { margin: 0; font-size: clamp(1.7rem, 5vw, 2.5rem); letter-spacing: -.04em; }
+    .intro, .note, .updated, .empty { color: #a7b2c8; }
+    .intro { margin: 8px 0 28px; }
+    .panel, .card { border: 1px solid #27334c; border-radius: 14px; background: #121a2c; }
+    .panel { padding: 18px; margin-bottom: 18px; }
+    label { display: block; margin-bottom: 9px; font-size: .9rem; font-weight: 650; }
+    .auth-row { display: flex; gap: 10px; }
+    input, button { min-height: 44px; border-radius: 8px; font: inherit; }
+    input { flex: 1; min-width: 0; padding: 0 12px; border: 1px solid #3a4965; background: #0b1020; color: inherit; }
+    button { padding: 0 17px; border: 0; background: #6478ff; color: white; font-weight: 700; cursor: pointer; }
+    button:hover { background: #7e8dff; }
+    button:focus-visible, input:focus-visible { outline: 2px solid #aeb8ff; outline-offset: 2px; }
+    #message { min-height: 1.4em; margin: 10px 0 0; color: #ffb4a9; font-size: .9rem; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .card { padding: 20px; }
+    .label { color: #a7b2c8; font-size: .86rem; }
+    .value { display: block; margin-top: 10px; font-size: clamp(1.5rem, 4vw, 2.1rem); font-variant-numeric: tabular-nums; font-weight: 750; }
+    .progress-track { height: 10px; margin-top: 18px; overflow: hidden; border-radius: 8px; background: #27334c; }
+    .progress-fill { width: 0; height: 100%; background: linear-gradient(90deg, #6478ff, #43d6a5); transition: width .3s ease; }
+    .progress-caption { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: #a7b2c8; font-size: .85rem; }
+    h2 { margin: 26px 0 12px; font-size: 1.1rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid #27334c; border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: 13px 15px; border-bottom: 1px solid #27334c; white-space: nowrap; }
+    th { color: #a7b2c8; font-size: .8rem; font-weight: 600; }
+    td:last-child, th:last-child { text-align: right; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .empty { padding: 18px 15px; }
+    .note { margin-top: 20px; font-size: .85rem; line-height: 1.6; }
+    .updated { margin-top: 12px; font-size: .8rem; }
+    @media (max-width: 650px) {
+      .grid { grid-template-columns: 1fr; }
+      .auth-row { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Revenue dashboard</h1>
+    <p class="intro">Progress toward the $1,000,000 recorded-revenue target.</p>
+
+    <section class="panel" aria-label="Dashboard access">
+      <label for="key">Dashboard key</label>
+      <div class="auth-row">
+        <input id="key" type="password" autocomplete="off" placeholder="Enter your REVENUE_DASHBOARD_KEY">
+        <button id="load" type="button">Load balance</button>
+      </div>
+      <p id="message" role="status" aria-live="polite"></p>
+    </section>
+
+    <section aria-label="Revenue summary">
+      <div class="grid">
+        <div class="card"><span class="label">Recorded paid receipts (USD)</span><strong class="value" id="revenue">—</strong></div>
+        <div class="card"><span class="label">Remaining to target</span><strong class="value" id="remaining">—</strong></div>
+        <div class="card"><span class="label">Paid payment records</span><strong class="value" id="count">—</strong></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="progress-track" role="progressbar" aria-label="Revenue target progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-fill" id="progress"></div>
+        </div>
+        <div class="progress-caption"><span id="percent">0%</span><span>Target: $1,000,000.00</span></div>
+      </div>
+    </section>
+
+    <h2>Recent recorded payments</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Plan</th><th>Date (UTC)</th><th>Amount</th></tr></thead>
+        <tbody id="payments"><tr><td class="empty" colspan="3">Load the dashboard to see payment records.</td></tr></tbody>
+      </table>
+    </div>
+    <p class="note">This view totals USD payment rows marked “paid” in the API ledger. It is not a live bank or blockchain wallet balance, and does not subtract refunds, fees, or expenses. Confirm funds with your payment provider or wallet before treating them as available cash.</p>
+    <p class="updated" id="updated"></p>
+  </main>
+  <script>
+    const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+    const date = value => value ? new Date(value).toLocaleString("en-US", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" }) : "—";
+    const message = document.getElementById("message");
+
+    async function loadDashboard() {
+      const key = document.getElementById("key").value;
+      message.textContent = "";
+      try {
+        const response = await fetch("/api/revenue/summary", { headers: { "X-Revenue-Dashboard-Key": key } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Could not load revenue summary.");
+
+        document.getElementById("revenue").textContent = usd.format(data.recorded_revenue_usd);
+        document.getElementById("remaining").textContent = usd.format(data.remaining_usd);
+        document.getElementById("count").textContent = data.payment_count.toLocaleString("en-US");
+        document.getElementById("percent").textContent = `${data.progress_percent.toLocaleString("en-US", { maximumFractionDigits: 2 })}%`;
+        document.getElementById("progress").style.width = `${Math.min(100, Math.max(0, data.progress_percent))}%`;
+        document.querySelector('[role="progressbar"]').setAttribute("aria-valuenow", Math.min(100, Math.max(0, data.progress_percent)));
+        document.getElementById("updated").textContent = data.updated_at ? `Most recent paid record: ${date(data.updated_at)} UTC` : "No paid USD records yet.";
+
+        const rows = document.getElementById("payments");
+        rows.replaceChildren();
+        if (data.recent_payments.length === 0) {
+          const row = rows.insertRow();
+          const cell = row.insertCell();
+          cell.colSpan = 3;
+          cell.className = "empty";
+          cell.textContent = "No paid USD payments recorded yet.";
+        } else {
+          for (const payment of data.recent_payments) {
+            const row = rows.insertRow();
+            row.insertCell().textContent = payment.tier;
+            row.insertCell().textContent = date(payment.paid_at);
+            row.insertCell().textContent = usd.format(payment.amount);
+          }
+        }
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    document.getElementById("load").addEventListener("click", loadDashboard);
+    document.getElementById("key").addEventListener("keydown", event => {
+      if (event.key === "Enter") loadDashboard();
+    });
+  </script>
+</body>
+</html>

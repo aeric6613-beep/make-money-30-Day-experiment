@@ -5,6 +5,7 @@ Stores check results in SQLite. Serves dashboard and API.
 
 import asyncio
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
@@ -12,7 +13,12 @@ from pathlib import Path
 
 import httpx
 
-DB_PATH = Path(__file__).parent / "data" / "monitors.db"
+_DATA_ROOT = os.environ.get("TOOLPIPE_DATA_DIR")
+DB_PATH = (
+    Path(_DATA_ROOT) / "uptime-monitor" / "monitors.db"
+    if _DATA_ROOT
+    else Path(__file__).parent / "data" / "monitors.db"
+)
 
 
 def get_db():

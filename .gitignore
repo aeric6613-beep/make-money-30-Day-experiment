@@ -12,6 +12,7 @@ products/api-service/waitlist.txt
 .env
 .env.*
 data/wallet.json
+products/api-service/data/wallet.json
 products/mcp-server/.npmrc
 products/mcp-server/mcp-publisher
 products/mcp-server/.mcpregistry_*
