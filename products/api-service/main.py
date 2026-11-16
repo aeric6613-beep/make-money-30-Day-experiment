@@ -7,6 +7,9 @@ import io
 import json
 import hashlib
 import base64
+import hmac
+import logging
+from html import escape as escape_html
 import re
 import time
 import uuid
@@ -14,9 +17,10 @@ import tempfile
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 import markdown
@@ -33,9 +37,14 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.pagesizes import letter
 
+logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(os.environ.get("TOOLPIPE_DATA_DIR", Path(__file__).parent / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 app = FastAPI(
     title="ToolPipe API",
-    description="240+ developer utility APIs. Web scraping, domain intelligence, bulk operations, API testing, sitemap parsing, content monitoring, code review, fake data, JSON Schema validation, security headers, API client generation, CSV analysis, code minification, QR codes, PDF tools, hashing, UUID, DNS, regex, JWT, SQL formatting, XML/YAML, text stats, and more. Free tier: 100 calls/day. Pro: 10,000 calls/day ($9.99/mo). Credits: 1K for $4.99. Pay with crypto, no KYC.",
+    description="Developer utility APIs for web scraping, domain intelligence, API testing, content monitoring, JSON, CSV, PDF, QR, hashing, UUID, DNS, and more. Free tier: 100 calls/day. Paid API plans use hosted crypto checkout when a merchant provider is configured.",
     version="1.19.0",
     contact={"name": "ToolPipe", "url": "https://toolpipe.dev", "email": "toolpipe-ads@sharebot.net"},
     license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
@@ -63,11 +72,13 @@ async def favicon():
 # x402 crypto payments (USDC on Base Sepolia)
 # Premium endpoints return HTTP 402 with payment instructions
 # AI agents and developers pay per-call via USDC
-WALLET_ADDRESS = "0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6"
-SOLANA_WALLET = os.environ.get("SOLANA_WALLET", "2guKDsPScRpCCKuVEGKBPFvodSNtZF4ArYeSC6oy6pf6")
+WALLET_ADDRESS = os.environ.get("EVM_WALLET_ADDRESS", "").strip()
+SOLANA_WALLET = os.environ.get("SOLANA_WALLET", "").strip()
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 X402_ENABLED = False
 try:
+    if not WALLET_ADDRESS:
+        raise RuntimeError("EVM_WALLET_ADDRESS is not configured")
     from fastapi_x402 import init_x402, pay
     init_x402(
         app=app,
@@ -93,7 +104,7 @@ async def pricing_info_json():
         "asset": "USDC",
         "tiers": PRICING_TIERS,
         "free_tier": {"daily_limit": 100, "endpoints": "all"},
-        "how_to_pay": "POST /payments/create with email and tier, then pay via crypto. Or send directly to the wallet and verify via /payments/verify-tx.",
+        "how_to_pay": "POST /payments/create with email and tier to receive a hosted provider checkout link. Access is activated only after a signed provider callback confirms payment.",
     }
 
 
@@ -102,7 +113,7 @@ async def pricing_page():
     return HTMLResponse(inject_snippet("""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>ToolPipe Pricing - API Plans for Developers and AI Agents</title>
-<meta name="description" content="ToolPipe API pricing. Free tier with 100 calls/day. Pro $9.99/mo for 10,000 calls/day. Enterprise $49.99/mo for 100,000 calls/day. Pay with crypto, no KYC.">
+<meta name="description" content="ToolPipe API pricing. Free tier with 100 calls/day. Pro and Enterprise plans provide 30 days of paid access per payment.">
 <link rel="canonical" href="https://toolpipe.dev/pricing">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -149,7 +160,7 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 </style></head><body>
 <div class="container">
 <h1>Simple, Transparent Pricing</h1>
-<p class="subtitle">230+ API endpoints. Pay with crypto. No KYC required.</p>
+<p class="subtitle">230+ API endpoints. Paid checkout is available when a supported provider is configured.</p>
 
 <div class="plans">
 <div class="plan">
@@ -168,7 +179,7 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 
 <div class="plan featured">
 <div class="plan-name">Pro</div>
-<div class="plan-price">$9.99<span>/month</span></div>
+<div class="plan-price">$9.99<span>/30 days</span></div>
 <div class="plan-desc">For developers and small teams shipping products</div>
 <ul class="plan-features">
 <li>10,000 API calls per day</li>
@@ -182,7 +193,7 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 
 <div class="plan">
 <div class="plan-name">Enterprise</div>
-<div class="plan-price">$49.99<span>/month</span></div>
+<div class="plan-price">$49.99<span>/30 days</span></div>
 <div class="plan-desc">For teams and AI agents needing high throughput</div>
 <ul class="plan-features">
 <li>100,000 API calls per day</li>
@@ -213,7 +224,7 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 <div class="step">
 <div class="step-num">2</div>
 <h3>Pay with Crypto</h3>
-<p>Send ETH, USDC, USDT, SOL, or any token to our wallet on Ethereum, Polygon, Arbitrum, Base, Optimism, or Solana.</p>
+<p>Available cryptocurrencies depend on the payment address shown at checkout. Only send supported assets on the matching network.</p>
 </div>
 <div class="step">
 <div class="step-num">3</div>
@@ -225,10 +236,10 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 
 <div class="faq">
 <h2>FAQ</h2>
-<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What cryptocurrencies do you accept?</div><div class="faq-a">We accept ETH, USDC, USDT, DAI, WETH on Ethereum, Polygon, Arbitrum, Base, and Optimism. We also accept SOL and USDC-SPL on Solana. Recommended: USDC on Base (lowest fees, ~$0.01 per tx).</div></div>
+<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What cryptocurrencies do you accept?</div><div class="faq-a">The available assets and networks are shown with the payment address at checkout. Do not send funds on a network that is not listed.</div></div>
 <div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Do I need KYC or identity verification?</div><div class="faq-a">No. We accept crypto payments with no identity verification required. Just an email address for your API key.</div></div>
-<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How is payment verified?</div><div class="faq-a">After sending payment, submit your transaction hash via our /payments/verify-tx endpoint. We verify the transaction on-chain across all supported networks automatically. Your API key is upgraded instantly upon verification.</div></div>
-<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can AI agents pay for themselves?</div><div class="faq-a">Yes. Our entire payment flow is API-first. An AI agent can POST to /payments/create, send crypto, then POST to /payments/verify-tx with the tx hash. Fully automated, zero human interaction needed.</div></div>
+<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How is payment verified?</div><div class="faq-a">Hosted checkout payments are activated only after the configured payment provider sends a valid signed callback confirming the final amount. Browser redirects are not treated as proof of payment.</div></div>
+<div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can AI agents pay for themselves?</div><div class="faq-a">Yes. An AI agent can POST to /payments/agent-pay and use the returned hosted checkout URL. Account access is activated after a signed provider callback confirms payment.</div></div>
 <div class="faq-item"><div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What happens if I exceed my daily limit?</div><div class="faq-a">Requests beyond your daily limit return HTTP 429. Your counter resets at midnight UTC. Upgrade to a higher tier for more capacity.</div></div>
 </div>
 </div>
@@ -238,61 +249,31 @@ h1{font-size:2.5rem;text-align:center;margin-bottom:8px;color:#fff}
 <div style="background:#1a1a1a;border:2px solid #6c63ff;border-radius:16px;padding:40px;max-width:520px;width:90%;position:relative;max-height:90vh;overflow-y:auto">
 <button onclick="closeCheckout()" style="position:absolute;top:12px;right:16px;background:none;border:none;color:#94a3b8;font-size:1.5rem;cursor:pointer">x</button>
 <h2 style="color:#fff;font-size:1.5rem;margin-bottom:8px" id="checkout-title">Upgrade to Pro</h2>
-<p style="color:#94a3b8;margin-bottom:24px" id="checkout-price">$9.99/month - 10,000 API calls/day</p>
+<p style="color:#94a3b8;margin-bottom:24px" id="checkout-price">$9.99 for 30 days - 10,000 API calls/day</p>
 
 <div id="checkout-step1">
 <label style="color:#cbd5e1;display:block;margin-bottom:8px;font-weight:600">Email Address</label>
 <input type="email" id="checkout-email" placeholder="you@email.com" style="width:100%;padding:12px 16px;background:#111;border:1px solid #2a2a2a;border-radius:8px;color:#e0e0e0;font-size:1rem;margin-bottom:16px">
+<label style="color:#cbd5e1;display:block;margin-bottom:8px;font-weight:600">Current API key (only if this email already has an account)</label>
+<input type="password" id="checkout-api-key" autocomplete="off" placeholder="tp_..." style="width:100%;padding:12px 16px;background:#111;border:1px solid #2a2a2a;border-radius:8px;color:#e0e0e0;font-size:1rem;margin-bottom:16px">
 <button onclick="createOrder()" id="checkout-btn" style="width:100%;padding:14px;background:#6c63ff;color:#fff;border:none;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer">Create Payment Order</button>
 </div>
 
-<div id="checkout-step2" style="display:none">
-<div style="background:#111;border:1px solid #22c55e;border-radius:12px;padding:20px;margin-bottom:16px">
-<p style="color:#22c55e;font-weight:700;margin-bottom:8px">Send crypto to this address:</p>
-<code style="color:#22c55e;font-size:0.85rem;word-break:break-all;display:block;margin-bottom:8px">0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6</code>
-<button onclick="navigator.clipboard.writeText('0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy Address',2000)" style="background:#22c55e;color:#000;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Copy Address</button>
-</div>
-<p style="color:#94a3b8;font-size:0.9rem;margin-bottom:4px">Amount: <strong style="color:#fff" id="checkout-amount">$9.99</strong> in any supported crypto</p>
-<p style="color:#64748b;font-size:0.85rem;margin-bottom:8px">EVM Networks: Ethereum, Polygon, Arbitrum, Base, Optimism</p>
-<div style="background:#111;border:1px solid #8b5cf6;border-radius:8px;padding:12px;margin-bottom:16px">
-<p style="color:#8b5cf6;font-weight:600;font-size:0.85rem;margin-bottom:4px">Solana (SOL, USDC-SPL):</p>
-<code style="color:#8b5cf6;font-size:0.8rem;word-break:break-all;display:block;margin-bottom:6px">2guKDsPScRpCCKuVEGKBPFvodSNtZF4ArYeSC6oy6pf6</code>
-<button onclick="navigator.clipboard.writeText('2guKDsPScRpCCKuVEGKBPFvodSNtZF4ArYeSC6oy6pf6');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy SOL Address',2000)" style="background:#8b5cf6;color:#fff;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:0.85rem">Copy SOL Address</button>
-</div>
-<p style="color:#64748b;font-size:0.85rem;margin-bottom:16px">Order ID: <code id="checkout-order-id" style="color:#6c63ff"></code></p>
-
-<label style="color:#cbd5e1;display:block;margin-bottom:8px;font-weight:600;margin-top:16px">Paste Transaction Hash</label>
-<input type="text" id="checkout-txhash" placeholder="0x..." style="width:100%;padding:12px 16px;background:#111;border:1px solid #2a2a2a;border-radius:8px;color:#e0e0e0;font-size:0.9rem;font-family:monospace;margin-bottom:16px">
-<button onclick="verifyPayment()" id="verify-btn" style="width:100%;padding:14px;background:#22c55e;color:#000;border:none;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer">Verify Payment On-Chain</button>
-<p id="verify-status" style="margin-top:12px;font-size:0.9rem;text-align:center"></p>
-</div>
-
-<div id="checkout-step3" style="display:none;text-align:center">
-<div style="font-size:3rem;margin-bottom:16px">&#10003;</div>
-<h3 style="color:#22c55e;font-size:1.3rem;margin-bottom:8px">Payment Verified!</h3>
-<p style="color:#cbd5e1;margin-bottom:16px">Your API key has been upgraded.</p>
-<p style="color:#fff;font-weight:700;margin-bottom:4px">API Key:</p>
-<code id="checkout-apikey" style="color:#22c55e;font-size:1rem;display:block;margin-bottom:24px;word-break:break-all"></code>
-<a href="/api-keys" style="display:inline-block;padding:12px 32px;background:#6c63ff;color:#fff;border-radius:8px;text-decoration:none;font-weight:600">View Dashboard</a>
-</div>
+<p id="checkout-error" style="display:none;color:#f87171;margin-top:12px" role="alert"></p>
 </div>
 </div>
 
 <script>
 let checkoutTier = 'pro';
-let checkoutOrderId = '';
 
 function startCheckout(tier) {
     checkoutTier = tier;
     const info = tier === 'enterprise'
-        ? {name:'Enterprise',price:'$49.99/month',desc:'$49.99/month - 100,000 API calls/day'}
-        : {name:'Pro',price:'$9.99/month',desc:'$9.99/month - 10,000 API calls/day'};
+        ? {name:'Enterprise',price:'$49.99 / 30 days',desc:'$49.99 for 30 days - 100,000 API calls/day'}
+        : {name:'Pro',price:'$9.99 / 30 days',desc:'$9.99 for 30 days - 10,000 API calls/day'};
     document.getElementById('checkout-title').textContent = 'Upgrade to ' + info.name;
     document.getElementById('checkout-price').textContent = info.desc;
-    document.getElementById('checkout-amount').textContent = info.price.replace('/month','');
-    document.getElementById('checkout-step1').style.display = 'block';
-    document.getElementById('checkout-step2').style.display = 'none';
-    document.getElementById('checkout-step3').style.display = 'none';
+    document.getElementById('checkout-error').style.display = 'none';
     document.getElementById('checkout-modal').style.display = 'flex';
 }
 function closeCheckout() { document.getElementById('checkout-modal').style.display = 'none'; }
@@ -300,6 +281,8 @@ function closeCheckout() { document.getElementById('checkout-modal').style.displ
 async function createOrder() {
     const email = document.getElementById('checkout-email').value.trim();
     if (!email || !email.includes('@')) { alert('Enter a valid email.'); return; }
+    const error = document.getElementById('checkout-error');
+    error.style.display = 'none';
     const btn = document.getElementById('checkout-btn');
     btn.textContent = 'Creating order...';
     btn.disabled = true;
@@ -307,62 +290,21 @@ async function createOrder() {
         const res = await fetch('/payments/create', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({email, tier: checkoutTier})
+            body: JSON.stringify({
+                email,
+                tier: checkoutTier,
+                api_key: document.getElementById('checkout-api-key').value.trim()
+            })
         });
         const data = await res.json();
-        if (data.order_id) {
-            checkoutOrderId = data.order_id;
-            document.getElementById('checkout-order-id').textContent = data.order_id;
-            document.getElementById('checkout-step1').style.display = 'none';
-            document.getElementById('checkout-step2').style.display = 'block';
-        } else {
-            alert('Error creating order: ' + JSON.stringify(data));
-        }
-    } catch(e) { alert('Network error. Try again.'); }
-    btn.textContent = 'Create Payment Order';
-    btn.disabled = false;
-}
-
-async function verifyPayment() {
-    const txHash = document.getElementById('checkout-txhash').value.trim();
-    const isEvm = txHash.startsWith('0x') && txHash.length === 66;
-    const isSolana = !txHash.startsWith('0x') && txHash.length >= 43 && txHash.length <= 88;
-    if (!txHash || (!isEvm && !isSolana)) {
-        alert('Enter a valid transaction hash. EVM: 0x + 64 hex chars. Solana: 43-88 base58 chars.');
-        return;
-    }
-    const btn = document.getElementById('verify-btn');
-    const status = document.getElementById('verify-status');
-    btn.textContent = 'Verifying on-chain...';
-    btn.disabled = true;
-    status.style.color = '#94a3b8';
-    status.textContent = 'Checking transaction across all supported networks...';
-    try {
-        const res = await fetch('/payments/verify-tx', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({order_id: checkoutOrderId, tx_hash: txHash})
-        });
-        const data = await res.json();
-        if (data.status === 'verified' || data.status === 'already_paid') {
-            document.getElementById('checkout-step2').style.display = 'none';
-            document.getElementById('checkout-step3').style.display = 'block';
-            document.getElementById('checkout-apikey').textContent = data.api_key || 'Check /api-keys dashboard';
-        } else if (data.status === 'unverified') {
-            status.style.color = '#f59e0b';
-            status.textContent = 'Transaction not confirmed yet. Wait a few minutes and try again.';
-        } else if (data.status === 'underpaid') {
-            status.style.color = '#ef4444';
-            status.textContent = 'Underpaid: received $' + (data.received||0).toFixed(2) + ' of $' + (data.expected||0).toFixed(2) + '. Send the remaining amount.';
-        } else {
-            status.style.color = '#ef4444';
-            status.textContent = data.message || 'Verification failed. Check the tx hash.';
-        }
+        if (!res.ok) throw new Error(data.detail || 'Could not create a payment.');
+        if (!data.payment_url) throw new Error('The payment provider did not return a checkout URL.');
+        window.location.assign(data.payment_url);
     } catch(e) {
-        status.style.color = '#ef4444';
-        status.textContent = 'Network error. Try again.';
+        error.textContent = 'Payment unavailable: ' + e.message;
+        error.style.display = 'block';
     }
-    btn.textContent = 'Verify Payment On-Chain';
+    btn.textContent = 'Create Payment Order';
     btn.disabled = false;
 }
 
@@ -388,8 +330,7 @@ def check_rate_limit(client_ip: str) -> bool:
 
 
 # --- Analytics DB ---
-ANALYTICS_DB = Path(__file__).parent / "data" / "analytics.db"
-ANALYTICS_DB.parent.mkdir(parents=True, exist_ok=True)
+ANALYTICS_DB = DATA_DIR / "analytics.db"
 _analytics_lock = threading.Lock()
 
 
@@ -417,7 +358,7 @@ _init_analytics()
 
 
 # --- API Key System ---
-API_KEYS_DB = Path(__file__).parent / "data" / "api_keys.db"
+API_KEYS_DB = DATA_DIR / "api_keys.db"
 _keys_lock = threading.Lock()
 
 
@@ -432,7 +373,18 @@ def _init_keys_db():
         requests_total INTEGER DEFAULT 0,
         daily_limit INTEGER DEFAULT 100,
         created_at TEXT NOT NULL,
-        last_used TEXT
+        last_used TEXT,
+        paid_until TEXT
+    )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(api_keys)")}
+    if "paid_until" not in columns:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN paid_until TEXT")
+    conn.execute("""CREATE TABLE IF NOT EXISTS paid_orders (
+        order_id TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        paid_until TEXT NOT NULL,
+        granted_at TEXT NOT NULL
     )""")
     conn.commit()
     conn.close()
@@ -450,7 +402,11 @@ def register_api_key(email: str) -> dict:
         existing = conn.execute("SELECT api_key, tier FROM api_keys WHERE email = ?", (email,)).fetchone()
         if existing:
             conn.close()
-            return {"api_key": existing[0], "tier": existing[1], "existing": True}
+            return {
+                "tier": existing[1],
+                "existing": True,
+                "message": "An API key already exists for this email. Existing keys cannot be retrieved by email.",
+            }
         key = generate_api_key()
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
@@ -459,46 +415,112 @@ def register_api_key(email: str) -> dict:
         )
         conn.commit()
         conn.close()
-        wl_file = Path(__file__).parent / "waitlist.txt"
+        wl_file = Path(os.environ.get("TOOLPIPE_WAITLIST_FILE", Path(__file__).parent / "waitlist.txt"))
         with open(wl_file, "a") as f:
             f.write(f"{email},{now},api_key_signup\n")
         return {"api_key": key, "tier": "free", "daily_limit": 100, "existing": False}
 
 
-def upgrade_api_key(email: str, tier: str = "pro") -> dict:
+def grant_paid_access(email: str, tier: str, order_id: str) -> dict:
     limits = {"pro": 10000, "enterprise": 100000}
-    daily_limit = limits.get(tier, 10000)
+    if tier not in limits:
+        raise ValueError(f"Unsupported paid tier: {tier}")
+    daily_limit = limits[tier]
     with _keys_lock:
         conn = sqlite3.connect(str(API_KEYS_DB))
-        row = conn.execute("SELECT api_key FROM api_keys WHERE email = ?", (email,)).fetchone()
-        if row:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_order = conn.execute(
+                "SELECT email, tier, paid_until FROM paid_orders WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+            if existing_order:
+                if existing_order[:2] != (email, tier):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Payment order was already applied to a different account.",
+                    )
+                key_row = conn.execute(
+                    "SELECT api_key FROM api_keys WHERE email = ?", (email,)
+                ).fetchone()
+                if not key_row:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Paid access record exists but its API key is missing.",
+                    )
+                conn.commit()
+                return {
+                    "api_key": key_row[0],
+                    "tier": tier,
+                    "daily_limit": daily_limit,
+                    "paid_until": existing_order[2],
+                }
+
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+            row = conn.execute(
+                "SELECT api_key, paid_until FROM api_keys WHERE email = ?",
+                (email,),
+            ).fetchone()
+            expiry_base = now
+            if row and row[1]:
+                current_expiry = datetime.fromisoformat(row[1])
+                if current_expiry > now:
+                    expiry_base = current_expiry
+            paid_until = (expiry_base + timedelta(days=30)).isoformat()
+            if row:
+                api_key = row[0]
+                conn.execute(
+                    "UPDATE api_keys SET tier = ?, daily_limit = ?, paid_until = ? WHERE email = ?",
+                    (tier, daily_limit, paid_until, email),
+                )
+            else:
+                api_key = generate_api_key()
+                conn.execute(
+                    "INSERT INTO api_keys "
+                    "(email, api_key, tier, daily_limit, created_at, paid_until) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (email, api_key, tier, daily_limit, now_iso, paid_until),
+                )
             conn.execute(
-                "UPDATE api_keys SET tier = ?, daily_limit = ? WHERE email = ?",
-                (tier, daily_limit, email)
+                "INSERT INTO paid_orders (order_id, email, tier, paid_until, granted_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (order_id, email, tier, paid_until, now_iso),
             )
             conn.commit()
-            api_key = row[0]
-        else:
-            api_key = generate_api_key()
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "INSERT INTO api_keys (email, api_key, tier, daily_limit, created_at) VALUES (?, ?, ?, ?, ?)",
-                (email, api_key, tier, daily_limit, now)
-            )
-            conn.commit()
-        conn.close()
-        return {"api_key": api_key, "tier": tier, "daily_limit": daily_limit}
+            return {
+                "api_key": api_key,
+                "tier": tier,
+                "daily_limit": daily_limit,
+                "paid_until": paid_until,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def check_api_key(key: str) -> dict | None:
     with _keys_lock:
         conn = sqlite3.connect(str(API_KEYS_DB))
         row = conn.execute(
-            "SELECT email, tier, requests_today, daily_limit FROM api_keys WHERE api_key = ?", (key,)
+            "SELECT email, tier, requests_today, daily_limit, paid_until "
+            "FROM api_keys WHERE api_key = ?",
+            (key,),
         ).fetchone()
         if not row:
             conn.close()
             return None
+        if row[1] in ("pro", "enterprise"):
+            paid_until = datetime.fromisoformat(row[4]) if row[4] else None
+            if paid_until is None or paid_until <= datetime.now(timezone.utc):
+                conn.execute(
+                    "UPDATE api_keys SET tier = 'free', daily_limit = 100, paid_until = NULL "
+                    "WHERE api_key = ?",
+                    (key,),
+                )
+                row = (row[0], "free", row[2], 100, None)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         conn.execute(
             "UPDATE api_keys SET requests_today = requests_today + 1, requests_total = requests_total + 1, last_used = ? WHERE api_key = ?",
@@ -506,17 +528,27 @@ def check_api_key(key: str) -> dict | None:
         )
         conn.commit()
         conn.close()
-        return {"email": row[0], "tier": row[1], "requests_today": row[2], "daily_limit": row[3]}
+        return {
+            "email": row[0],
+            "tier": row[1],
+            "requests_today": row[2],
+            "daily_limit": row[3],
+            "paid_until": row[4],
+        }
 
 
 # --- Crypto Payment Gateway Integration ---
 # OxaPay Merchant API (primary gateway)
-OXAPAY_MERCHANT_KEY = os.environ.get("OXAPAY_MERCHANT_KEY", "sandbox")
-OXAPAY_API_URL = "https://api.oxapay.com/merchants/request"
-# NOWPayments (backup gateway, no KYC)
-NOWPAYMENTS_API_KEY = os.environ.get("NOWPAYMENTS_API_KEY", "")
-PAYMENTS_DB = Path(__file__).parent / "data" / "payments.db"
+OXAPAY_MERCHANT_KEY = os.environ.get("OXAPAY_MERCHANT_KEY", "").strip()
+OXAPAY_API_URL = "https://api.oxapay.com/v1/payment/invoice"
+# NOWPayments (alternate gateway)
+NOWPAYMENTS_API_KEY = os.environ.get("NOWPAYMENTS_API_KEY", "").strip()
+NOWPAYMENTS_IPN_SECRET = os.environ.get("NOWPAYMENTS_IPN_SECRET", "").strip()
+PAYMENTS_PUBLIC_BASE_URL = os.environ.get("PAYMENTS_PUBLIC_BASE_URL", "").strip()
+PAYMENTS_DB = DATA_DIR / "payments.db"
 _payments_lock = threading.Lock()
+REVENUE_DASHBOARD_KEY = os.environ.get("REVENUE_DASHBOARD_KEY", "")
+REVENUE_TARGET_USD = 1_000_000.00
 
 
 def _init_payments_db():
@@ -533,132 +565,256 @@ def _init_payments_db():
         payment_url TEXT,
         created_at TEXT NOT NULL,
         paid_at TEXT,
+        gateway TEXT NOT NULL DEFAULT 'direct_crypto',
+        tx_hash TEXT,
         callback_data TEXT
     )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(payments)")}
+    if "gateway" not in columns:
+        conn.execute("ALTER TABLE payments ADD COLUMN gateway TEXT NOT NULL DEFAULT 'direct_crypto'")
+    if "tx_hash" not in columns:
+        conn.execute("ALTER TABLE payments ADD COLUMN tx_hash TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_unique_tx_hash "
+        "ON payments(tx_hash) WHERE tx_hash IS NOT NULL"
+    )
     conn.commit()
     conn.close()
 
 _init_payments_db()
 
 
+def _payment_public_base_url() -> str:
+    parsed = urlparse(PAYMENTS_PUBLIC_BASE_URL)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Set PAYMENTS_PUBLIC_BASE_URL to the service's public HTTPS origin before creating invoices.",
+        )
+    return PAYMENTS_PUBLIC_BASE_URL.rstrip("/")
+
+
+def _sorted_json(value):
+    if isinstance(value, dict):
+        return {key: _sorted_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sorted_json(item) for item in value]
+    return value
+
+
+def _valid_nowpayments_signature(payload: dict, signature: str) -> bool:
+    if not NOWPAYMENTS_IPN_SECRET or not signature:
+        return False
+    serialized = json.dumps(_sorted_json(payload), separators=(",", ":"), ensure_ascii=False)
+    expected = hmac.new(
+        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
+        serialized.encode("utf-8"),
+        hashlib.sha512,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature.lower())
+
+
+def _insert_payment_invoice(
+    gateway: str,
+    track_id: str,
+    order_id: str,
+    email: str,
+    tier: str,
+    amount: float,
+    payment_url: str,
+):
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
+        try:
+            conn.execute(
+                "INSERT INTO payments "
+                "(track_id, order_id, email, tier, amount, status, payment_url, created_at, gateway) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    track_id,
+                    order_id,
+                    email,
+                    tier,
+                    amount,
+                    payment_url,
+                    datetime.now(timezone.utc).isoformat(),
+                    gateway,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+async def _confirm_oxapay_paid_invoice(
+    track_id: str, order_id: str, expected_amount: float
+) -> bool:
+    if not OXAPAY_MERCHANT_KEY or not track_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                f"https://api.oxapay.com/v1/payment/{quote(track_id, safe='')}",
+                headers={"merchant_api_key": OXAPAY_MERCHANT_KEY},
+            )
+            response.raise_for_status()
+            result = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("OxaPay payment status lookup failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not confirm payment status with OxaPay; retry the callback.",
+        ) from exc
+
+    invoice = result.get("data") if isinstance(result, dict) else None
+    if (
+        not isinstance(invoice, dict)
+        or result.get("status") != 200
+        or str(invoice.get("track_id", "")) != track_id
+        or str(invoice.get("order_id", "")) != order_id
+        or str(invoice.get("status", "")).lower() != "paid"
+        or str(invoice.get("currency", "")).upper() != "USD"
+    ):
+        return False
+    try:
+        confirmed_amount = Decimal(str(invoice.get("amount")))
+        required_amount = Decimal(str(expected_amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return confirmed_amount.is_finite() and confirmed_amount >= required_amount
+
+
+async def create_oxapay_invoice(
+    amount: float, email: str, tier: str, order_id: str, callback_url: str, return_url: str
+) -> dict:
+    if not OXAPAY_MERCHANT_KEY:
+        return {"success": False}
+    payload = {
+        "amount": amount,
+        "currency": "USD",
+        "lifetime": 60,
+        "fee_paid_by_payer": 1,
+        "under_paid_coverage": 0,
+        "callback_url": callback_url,
+        "return_url": return_url,
+        "email": email,
+        "order_id": order_id,
+        "description": f"ToolPipe {tier.title()} Plan",
+        "sandbox": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                OXAPAY_API_URL,
+                json=payload,
+                headers={
+                    "merchant_api_key": OXAPAY_MERCHANT_KEY,
+                    "Content-Type": "application/json",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("OxaPay invoice request failed: %s", type(exc).__name__)
+        return {"success": False}
+
+    invoice = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(invoice, dict) or data.get("status") != 200:
+        logger.warning("OxaPay rejected an invoice request")
+        return {"success": False}
+    track_id = str(invoice.get("track_id", ""))
+    payment_url = str(invoice.get("payment_url", ""))
+    if not track_id or urlparse(payment_url).scheme != "https" or not urlparse(payment_url).netloc:
+        logger.warning("OxaPay invoice response omitted its track ID or payment URL")
+        return {"success": False}
+    return {
+        "success": True,
+        "gateway": "oxapay",
+        "payment_url": payment_url,
+        "track_id": track_id,
+        "order_id": order_id,
+    }
+
+
 async def create_nowpayments_invoice(amount: float, email: str, tier: str, order_id: str, callback_url: str, return_url: str) -> dict:
     """Create invoice via NOWPayments API (backup gateway)."""
-    if not NOWPAYMENTS_API_KEY:
+    if not NOWPAYMENTS_API_KEY or not NOWPAYMENTS_IPN_SECRET:
         return {"success": False}
+    payload = {
+        "price_amount": amount,
+        "price_currency": "usd",
+        "order_id": order_id,
+        "order_description": f"ToolPipe {tier.title()} Plan",
+        "ipn_callback_url": callback_url,
+        "success_url": return_url,
+        "cancel_url": return_url.replace("success", "cancel"),
+    }
     try:
-        payload = {
-            "price_amount": amount,
-            "price_currency": "usd",
-            "order_id": order_id,
-            "order_description": f"ToolPipe {tier.title()} Plan",
-            "ipn_callback_url": callback_url,
-            "success_url": return_url,
-            "cancel_url": return_url.replace("success", "cancel"),
-        }
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
+            response = await client.post(
                 "https://api.nowpayments.io/v1/invoice",
                 json=payload,
                 headers={"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"},
             )
-            data = resp.json()
-        if data.get("id"):
-            return {
-                "success": True,
-                "gateway": "nowpayments",
-                "payment_url": data.get("invoice_url", ""),
-                "track_id": str(data["id"]),
-                "order_id": order_id,
-            }
-    except Exception:
-        pass
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("NOWPayments invoice request failed: %s", type(exc).__name__)
+        return {"success": False}
+
+    invoice_url = str(data.get("invoice_url", "")) if isinstance(data, dict) else ""
+    if (
+        isinstance(data, dict)
+        and data.get("id")
+        and urlparse(invoice_url).scheme == "https"
+        and urlparse(invoice_url).netloc
+    ):
+        return {
+            "success": True,
+            "gateway": "nowpayments",
+            "payment_url": invoice_url,
+            "track_id": str(data["id"]),
+            "order_id": order_id,
+        }
+    logger.warning("NOWPayments invoice response omitted its ID or payment URL")
     return {"success": False}
 
 
 async def create_payment_invoice(amount: float, email: str, tier: str, order_id: str, callback_url: str, return_url: str) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
-    crypto_addresses = {
-        "ETH/ERC-20 (Ethereum, Polygon, Arbitrum, Base, Optimism)": WALLET_ADDRESS,
-        "Solana (SOL, USDC-SPL)": SOLANA_WALLET,
-    }
-
-    # Try OxaPay Merchant API first
-    try:
-        payload = {
-            "merchant": OXAPAY_MERCHANT_KEY,
-            "amount": amount,
-            "currency": "USD",
-            "lifeTime": 60,
-            "feePaidByPayer": 1,
-            "callbackUrl": callback_url,
-            "returnUrl": return_url,
-            "email": email,
-            "orderId": order_id,
-            "description": f"ToolPipe {tier.title()} Plan",
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                OXAPAY_API_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            data = resp.json()
-
-        if data.get("result") == 100 and data.get("payLink"):
-            track_id = str(data.get("trackId", ""))
-            payment_url = data.get("payLink", "")
-            with _payments_lock:
-                conn = sqlite3.connect(str(PAYMENTS_DB))
-                conn.execute(
-                    "INSERT OR REPLACE INTO payments (track_id, order_id, email, tier, amount, status, payment_url, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                    (track_id, order_id, email, tier, amount, payment_url, now)
-                )
-                conn.commit()
-                conn.close()
-            return {"success": True, "gateway": "oxapay", "payment_url": payment_url, "track_id": track_id, "order_id": order_id}
-    except Exception:
-        pass
-
-    # Try NOWPayments as backup
-    np_result = await create_nowpayments_invoice(amount, email, tier, order_id, callback_url, return_url)
-    if np_result.get("success"):
-        with _payments_lock:
-            conn = sqlite3.connect(str(PAYMENTS_DB))
-            conn.execute(
-                "INSERT OR REPLACE INTO payments (track_id, order_id, email, tier, amount, status, payment_url, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (np_result.get("track_id", order_id), order_id, email, tier, amount, np_result.get("payment_url", ""), now)
-            )
-            conn.commit()
-            conn.close()
-        return np_result
-
-    # Direct crypto payment (always-available fallback)
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        conn.execute(
-            "INSERT OR REPLACE INTO payments (track_id, order_id, email, tier, amount, status, created_at) VALUES (?, ?, ?, ?, ?, 'awaiting_direct', ?)",
-            (order_id, order_id, email, tier, amount, now)
+    if OXAPAY_MERCHANT_KEY:
+        result = await create_oxapay_invoice(
+            amount, email, tier, order_id,
+            f"{callback_url}/oxapay", return_url,
         )
-        conn.commit()
-        conn.close()
-    result = {
-        "success": True,
-        "gateway": "direct_crypto",
-        "payment_method": "crypto_direct",
-        "crypto_addresses": crypto_addresses,
-        "evm_address": WALLET_ADDRESS,
-        "accepted_evm": ["ETH", "USDC", "USDT", "DAI", "BUSD", "WETH", "BNB", "AVAX", "any ERC-20"],
-        "evm_networks": ["Ethereum", "Polygon", "Arbitrum", "Base", "Optimism", "BSC", "Avalanche"],
-        "amount_usd": amount,
-        "order_id": order_id,
-        "qr_code_url": f"/qr/generate?text=ethereum:{WALLET_ADDRESS}&size=300",
-        "verify_endpoint": "POST /payments/verify-tx with {order_id, tx_hash}",
-        "instructions": f"Send ${amount} worth of crypto to any address above. Then POST /payments/verify-tx with your tx_hash and order_id ({order_id}). Your API key upgrades instantly on verification.",
-    }
-    if SOLANA_WALLET:
-        result["solana_address"] = SOLANA_WALLET
-        result["accepted_solana"] = ["SOL", "USDC-SPL"]
-    return result
+        if result.get("success"):
+            _insert_payment_invoice(
+                "oxapay", result["track_id"], order_id, email, tier, amount, result["payment_url"]
+            )
+            return result
+
+    if NOWPAYMENTS_API_KEY and NOWPAYMENTS_IPN_SECRET:
+        result = await create_nowpayments_invoice(
+            amount, email, tier, order_id,
+            f"{callback_url}/nowpayments", return_url,
+        )
+        if result.get("success"):
+            _insert_payment_invoice(
+                "nowpayments", result["track_id"], order_id, email, tier, amount, result["payment_url"]
+            )
+            return result
+
+    raise HTTPException(
+        status_code=503,
+        detail="No working payment provider is configured. Configure OxaPay or NOWPayments with its verified webhook secret.",
+    )
 
 
 def record_pageview(path: str, ip: str, user_agent: str, referrer: str):
@@ -745,12 +901,19 @@ function tpCapture(e){
 
 def inject_snippet(html: str) -> str:
     """Inject analytics, favicon, and monetization snippet into HTML pages."""
+    html = html.replace("__EVM_WALLET_ADDRESS__", escape_html(WALLET_ADDRESS))
+    html = html.replace("__SOLANA_WALLET_ADDRESS__", escape_html(SOLANA_WALLET))
     favicon_tag = '<link rel="icon" href="/favicon.ico" type="image/x-icon">'
     if "<head>" in html and 'rel="icon"' not in html:
         html = html.replace("<head>", "<head>" + favicon_tag)
+    wallet_script = """<script>
+document.querySelectorAll('[data-wallet-address]').forEach(section => {
+    if (!section.dataset.walletAddress) section.hidden = true;
+});
+</script>"""
     if "</body>" in html:
-        return html.replace("</body>", INJECT_SNIPPET + "</body>")
-    return html + INJECT_SNIPPET
+        return html.replace("</body>", wallet_script + INJECT_SNIPPET + "</body>")
+    return html + wallet_script + INJECT_SNIPPET
 
 
 def serve_html(path: Path, track_path: str = "") -> HTMLResponse:
@@ -857,8 +1020,8 @@ async def rate_limit_middleware(request: Request, call_next):
                     content={
                         "error": "This endpoint requires a Pro or Enterprise plan.",
                         "endpoint": path,
-                        "upgrade": "Upgrade at /pricing. Pay with crypto, no KYC needed.",
-                        "pricing": {"pro": "$9.99/mo (10K calls/day)", "enterprise": "$49.99/mo (100K calls/day)"},
+                        "upgrade": "Upgrade at /pricing using hosted provider checkout.",
+                        "pricing": {"pro": "$9.99 per 30 days", "enterprise": "$49.99 per 30 days"},
                     },
                 )
         else:
@@ -994,8 +1157,8 @@ async def api_info():
         },
         "pricing": {
             "free": "100 requests/day, no signup",
-            "pro": "$9.99/mo, 10,000 requests/day",
-            "enterprise": "$49.99/mo, 100,000 requests/day",
+            "pro": "$9.99 per 30 days, 10,000 requests/day",
+            "enterprise": "$49.99 per 30 days, 100,000 requests/day",
         },
         "docs": "/docs",
     }
@@ -2503,7 +2666,7 @@ a{color:#6c63ff;text-decoration:none}
 </div>
 <div class="tier pro">
 <h3>Pro</h3>
-<div class="price">$9.99 <span>/month</span></div>
+<div class="price">$9.99 <span>/30 days</span></div>
 <ul>
 <li>10,000 requests/day</li>
 <li>All endpoints</li>
@@ -2537,10 +2700,9 @@ function getKey(e){
   fetch('/api-keys/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})})
   .then(r=>r.json()).then(d=>{
     var el=document.getElementById('key-result');
-    if(d.api_key){
-      el.style.display='block';
-      el.innerHTML='Your API Key: <strong>'+d.api_key+'</strong><br><br><small>Add to requests as: <code>?api_key='+d.api_key+'</code> or header <code>X-API-Key: '+d.api_key+'</code></small>';
-    }
+    el.style.display='block';
+    if(d.api_key) el.textContent='Your API key: '+d.api_key;
+    else el.textContent=d.message||'Could not create an API key.';
   });
   return false;
 }
@@ -2551,28 +2713,31 @@ function getKey(e){
 # --- API Key Usage Endpoint ---
 
 @app.get("/api-keys/usage")
-async def api_key_usage(api_key: str = "", email: str = ""):
+async def api_key_usage(api_key: str = ""):
     """Check API key usage and limits. AI agents can use this to monitor their consumption."""
-    if not api_key and not email:
-        raise HTTPException(status_code=400, detail="Provide api_key or email parameter")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key parameter is required.")
     with _keys_lock:
         conn = sqlite3.connect(str(API_KEYS_DB))
-        if api_key:
-            row = conn.execute(
-                "SELECT email, api_key, tier, requests_today, requests_total, daily_limit, created_at, last_used FROM api_keys WHERE api_key = ?",
-                (api_key,)
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT email, api_key, tier, requests_today, requests_total, daily_limit, created_at, last_used FROM api_keys WHERE email = ?",
-                (email.strip().lower(),)
-            ).fetchone()
+        row = conn.execute(
+            "SELECT email, api_key, tier, requests_today, requests_total, daily_limit, created_at, last_used, paid_until FROM api_keys WHERE api_key = ?",
+            (api_key,)
+        ).fetchone()
+        if row and row[2] in ("pro", "enterprise"):
+            paid_until = datetime.fromisoformat(row[8]) if row[8] else None
+            if paid_until is None or paid_until <= datetime.now(timezone.utc):
+                conn.execute(
+                    "UPDATE api_keys SET tier = 'free', daily_limit = 100, paid_until = NULL WHERE api_key = ?",
+                    (api_key,),
+                )
+                conn.commit()
+                row = (*row[:2], "free", *row[3:6], row[6], row[7], None)
         conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="API key not found")
     return {
         "email": row[0],
-        "api_key": row[1][:8] + "..." if api_key else row[1],
+        "api_key": row[1][:8] + "...",
         "tier": row[2],
         "requests_today": row[3],
         "requests_total": row[4],
@@ -2580,6 +2745,7 @@ async def api_key_usage(api_key: str = "", email: str = ""):
         "remaining_today": max(0, row[5] - row[3]),
         "created_at": row[6],
         "last_used": row[7],
+        "paid_until": row[8],
         "upgrade_url": "/pricing" if row[2] == "free" else None,
     }
 
@@ -2599,7 +2765,7 @@ async def join_waitlist(req: WaitlistRequest):
     if email not in waitlist_emails:
         waitlist_emails.append(email)
         # Also append to a file for persistence
-        wl_file = Path(__file__).parent / "waitlist.txt"
+        wl_file = Path(os.environ.get("TOOLPIPE_WAITLIST_FILE", Path(__file__).parent / "waitlist.txt"))
         with open(wl_file, "a") as f:
             f.write(f"{email},{datetime.now(timezone.utc).isoformat()}\n")
     return {"joined": True, "position": len(waitlist_emails)}
@@ -3699,22 +3865,48 @@ PRICING_TIERS = {
 class PaymentRequest(BaseModel):
     email: str
     tier: str = "pro"
+    api_key: str = ""
+
+
+def _validate_checkout_owner(email: str, api_key: str):
+    with _keys_lock:
+        conn = sqlite3.connect(str(API_KEYS_DB))
+        try:
+            row = conn.execute(
+                "SELECT api_key FROM api_keys WHERE email = ?", (email,)
+            ).fetchone()
+        finally:
+            conn.close()
+    if row and (not api_key or not hmac.compare_digest(row[0], api_key)):
+        raise HTTPException(
+            status_code=403,
+            detail="This email already has an account. Supply its current API key to upgrade it.",
+        )
+    if not row and api_key:
+        raise HTTPException(status_code=403, detail="The supplied API key does not belong to this email.")
 
 
 @app.post("/payments/create")
-async def create_payment(req: PaymentRequest, request: Request):
+async def create_payment(req: PaymentRequest):
     email = req.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email required")
+    _validate_checkout_owner(email, req.api_key)
     tier = req.tier.lower()
     if tier not in PRICING_TIERS:
         raise HTTPException(status_code=400, detail=f"Invalid tier. Options: {', '.join(PRICING_TIERS.keys())}")
 
     tier_info = PRICING_TIERS[tier]
-    order_id = f"tp-{tier}-{uuid.uuid4().hex[:12]}"
+    order_id = f"tp-{tier}-{uuid.uuid4().hex}"
 
-    # Build callback/return URLs from request
-    base_url = str(request.base_url).rstrip("/")
+    if not OXAPAY_MERCHANT_KEY and not (
+        NOWPAYMENTS_API_KEY and NOWPAYMENTS_IPN_SECRET
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="No payment provider with verified webhook credentials is configured.",
+        )
+    base_url = _payment_public_base_url()
     callback_url = f"{base_url}/payments/webhook"
     return_url = f"{base_url}/payments/success?order_id={order_id}"
 
@@ -3729,80 +3921,282 @@ async def create_payment(req: PaymentRequest, request: Request):
     return result
 
 
+async def _process_payment_webhook(request: Request, gateway: str) -> Response:
+    body = await request.body()
+    if len(body) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Webhook payload is too large.")
+
+    if gateway == "oxapay":
+        if not OXAPAY_MERCHANT_KEY:
+            raise HTTPException(status_code=503, detail="OxaPay webhook verification is not configured.")
+        signature = request.headers.get("hmac", "")
+        expected = hmac.new(
+            OXAPAY_MERCHANT_KEY.encode("utf-8"), body, hashlib.sha512
+        ).hexdigest()
+        if not signature or not hmac.compare_digest(expected, signature.lower()):
+            raise HTTPException(status_code=401, detail="Invalid payment webhook signature.")
+    elif gateway == "nowpayments":
+        if not NOWPAYMENTS_IPN_SECRET:
+            raise HTTPException(status_code=503, detail="NOWPayments webhook verification is not configured.")
+        try:
+            signed_payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid webhook JSON.") from exc
+        if not isinstance(signed_payload, dict) or not _valid_nowpayments_signature(
+            signed_payload, request.headers.get("x-nowpayments-sig", "")
+        ):
+            raise HTTPException(status_code=401, detail="Invalid payment webhook signature.")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported payment provider.")
+
+    if gateway == "oxapay":
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid webhook JSON.") from exc
+        if not isinstance(payload, dict) or payload.get("type") not in ("invoice", "payment"):
+            raise HTTPException(status_code=400, detail="Unsupported OxaPay callback type.")
+        order_id = str(payload.get("order_id") or payload.get("orderId") or "")
+        track_id = str(payload.get("track_id") or payload.get("trackId") or "")
+        payment_status = str(payload.get("status", "")).lower()
+    else:
+        payload = signed_payload
+        order_id = str(payload.get("order_id") or "")
+        track_id = str(payload.get("invoice_id") or "")
+        payment_status = str(payload.get("payment_status", "")).lower()
+        amount_value = payload.get("price_amount")
+        if str(payload.get("price_currency", "")).lower() != "usd":
+            raise HTTPException(status_code=400, detail="Payment invoice currency does not match USD.")
+
+    if not order_id:
+        raise HTTPException(status_code=400, detail="Webhook is missing its order ID.")
+
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
+        try:
+            row = conn.execute(
+                "SELECT email, tier, amount, status, track_id, gateway "
+                "FROM payments WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment order not found.")
+
+    email, tier, expected_amount, current_status, saved_track_id, saved_gateway = row
+    if saved_gateway != gateway:
+        raise HTTPException(status_code=400, detail="Payment order belongs to a different provider.")
+    if gateway == "oxapay" and (not track_id or track_id != saved_track_id):
+        raise HTTPException(status_code=400, detail="OxaPay track ID does not match the order.")
+    if gateway == "nowpayments" and (not track_id or track_id != saved_track_id):
+        raise HTTPException(status_code=400, detail="NOWPayments invoice ID does not match the order.")
+    if current_status == "paid":
+        return Response(content="ok", media_type="text/plain")
+
+    final_status = "paid" if (
+        payment_status == ("paid" if gateway == "oxapay" else "finished")
+    ) else None
+    if final_status is None:
+        return Response(content="ok", media_type="text/plain")
+
+    if gateway == "oxapay":
+        if not await _confirm_oxapay_paid_invoice(
+            track_id, order_id, expected_amount
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="OxaPay's payment record is not a paid USD invoice for the required amount.",
+            )
+    else:
+        if str(payload.get("price_currency", "")).lower() != "usd":
+            raise HTTPException(status_code=400, detail="Payment invoice currency does not match USD.")
+        try:
+            invoice_amount = Decimal(str(amount_value))
+            required_amount = Decimal(str(expected_amount))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Webhook is missing a valid invoice amount.") from exc
+        if not invoice_amount.is_finite() or invoice_amount != required_amount:
+            raise HTTPException(status_code=400, detail="Payment invoice amount does not match the order.")
+
+    grant_paid_access(email, tier, order_id)
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
+        try:
+            conn.execute(
+                "UPDATE payments SET status = 'paid', paid_at = ?, callback_data = ? "
+                "WHERE order_id = ? AND gateway = ? AND status != 'paid'",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                    order_id,
+                    gateway,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return Response(content="ok", media_type="text/plain")
+
+
 @app.post("/payments/webhook")
 async def payment_webhook(request: Request):
-    """Handles webhooks from OxaPay, NOWPayments, or generic payment callbacks."""
-    try:
-        data = await request.json()
-    except Exception:
-        body = await request.body()
+    """Compatibility endpoint; new invoices use provider-specific callback paths."""
+    gateway = "nowpayments" if request.headers.get("x-nowpayments-sig") else "oxapay"
+    return await _process_payment_webhook(request, gateway)
+
+
+@app.post("/payments/webhook/oxapay")
+async def oxapay_payment_webhook(request: Request):
+    return await _process_payment_webhook(request, "oxapay")
+
+
+@app.post("/payments/webhook/nowpayments")
+async def nowpayments_payment_webhook(request: Request):
+    return await _process_payment_webhook(request, "nowpayments")
+
+
+class ClaimPaymentRequest(BaseModel):
+    order_id: str
+
+
+@app.post("/payments/claim")
+async def claim_payment_access(req: ClaimPaymentRequest):
+    order_id = req.order_id
+    if not re.fullmatch(r"tp-(?:pro|enterprise)-[a-f0-9]{32}", order_id):
+        raise HTTPException(status_code=404, detail="Payment order not found.")
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
         try:
-            data = json.loads(body)
-        except Exception:
-            return {"status": "error", "message": "Invalid payload"}
-
-    # OxaPay v1 format
-    track_id = data.get("trackId", data.get("track_id", ""))
-    status = data.get("status", "")
-    order_id = data.get("orderId", data.get("order_id", ""))
-
-    # NOWPayments format
-    if not order_id and data.get("payment_id"):
-        order_id = data.get("order_id", "")
-        track_id = str(data.get("payment_id", ""))
-    if not status and data.get("payment_status"):
-        np_status = data["payment_status"]
-        if np_status in ("finished", "confirmed", "partially_paid"):
-            status = "paid"
-
-    paid_statuses = ("Paid", "Confirming", "Complete", "paid", "complete", "finished", "confirmed")
-    if status.lower() in [s.lower() for s in paid_statuses]:
-        now = datetime.now(timezone.utc).isoformat()
-        with _payments_lock:
-            conn = sqlite3.connect(str(PAYMENTS_DB))
             row = conn.execute(
-                "SELECT email, tier FROM payments WHERE track_id = ? OR order_id = ?",
-                (track_id, order_id)
+                "SELECT email, tier, status FROM payments WHERE order_id = ?",
+                (order_id,),
             ).fetchone()
-            if row:
-                email, tier = row
-                conn.execute(
-                    "UPDATE payments SET status = ?, paid_at = ?, callback_data = ? WHERE track_id = ? OR order_id = ?",
-                    (status, now, json.dumps(data), track_id, order_id)
-                )
-                conn.commit()
-                upgrade_api_key(email, tier)
+        finally:
             conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment order not found.")
+    if row[2] != "paid":
+        return JSONResponse(
+            {"status": "pending"},
+            status_code=202,
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
-    return {"status": "ok"}
+    with _keys_lock:
+        conn = sqlite3.connect(str(API_KEYS_DB))
+        try:
+            key_row = conn.execute(
+                "SELECT api_key, daily_limit, paid_until FROM api_keys WHERE email = ?",
+                (row[0],),
+            ).fetchone()
+        finally:
+            conn.close()
+    if not key_row:
+        raise HTTPException(status_code=503, detail="Paid access is still being activated.")
+    return JSONResponse(
+        {
+            "status": "paid",
+            "tier": row[1],
+            "api_key": key_row[0],
+            "daily_limit": key_row[1],
+            "paid_until": key_row[2],
+        },
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 @app.get("/payments/success", response_class=HTMLResponse)
 async def payment_success(order_id: str = ""):
-    return HTMLResponse(inject_snippet(f"""<!DOCTYPE html>
+    if not re.fullmatch(r"tp-(?:pro|enterprise)-[a-f0-9]{32}", order_id):
+        raise HTTPException(status_code=404, detail="Payment order not found.")
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
+        try:
+            row = conn.execute(
+                "SELECT status FROM payments WHERE order_id = ?", (order_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment order not found.")
+    is_paid = row[0] == "paid"
+    title = "Payment confirmed" if is_paid else "Payment pending"
+    message = (
+        "The provider confirmed the payment. Your API key is shown below."
+        if is_paid
+        else "Waiting for final confirmation from the provider. A redirect is not proof of payment."
+    )
+    color = "#22c55e" if is_paid else "#f59e0b"
+    safe_order_id = escape_html(order_id)
+    return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Payment Successful - ToolPipe</title>
+<meta name="referrer" content="no-referrer">
+<title>{title} - ToolPipe</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh}}
-.card{{background:#1a1a1a;border:2px solid #22c55e;border-radius:16px;padding:48px;text-align:center;max-width:500px}}
-h1{{color:#22c55e;font-size:2rem;margin-bottom:12px}}
+.card{{background:#1a1a1a;border:2px solid {color};border-radius:16px;padding:48px;text-align:center;max-width:500px}}
+h1{{color:{color};font-size:2rem;margin-bottom:12px}}
 p{{color:#94a3b8;line-height:1.6;margin-bottom:16px}}
 .order{{font-family:monospace;color:#6c63ff;background:#111;padding:8px 16px;border-radius:8px;display:inline-block;margin:8px 0}}
 a{{color:#6c63ff;text-decoration:none}}
 .btn{{display:inline-block;background:#6c63ff;color:#fff;padding:12px 32px;border-radius:8px;font-weight:600;margin-top:16px}}
+.key{{display:none;margin:16px 0;padding:12px;background:#0b1020;border-radius:8px;word-break:break-all;font-family:monospace;color:#43d6a5}}
 </style></head><body>
 <div class="card">
-<h1>Payment Received!</h1>
-<p>Your Pro access is being activated. You will receive your upgraded API key shortly.</p>
-<div class="order">{order_id}</div>
-<p>Check your API key status on the <a href="/api-keys">dashboard</a>.</p>
+<h1 id="title">{title}</h1>
+<p id="message">{message}</p>
+<div class="order">{safe_order_id}</div>
+<code class="key" id="api-key"></code>
+<p id="key-note">Keep this API key private. You can also view usage from the API dashboard.</p>
 <a href="/api-keys" class="btn">View API Dashboard</a>
 </div>
-</body></html>"""))
+<script>
+const orderId = {json.dumps(order_id)};
+let attempts = 0;
+async function loadAccess() {{
+  try {{
+    const response = await fetch("/payments/claim", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{order_id: orderId}}),
+      cache: "no-store"
+    }});
+    const data = await response.json();
+    if (response.ok && data.status === "paid") {{
+      document.getElementById("title").textContent = "Payment confirmed";
+      document.getElementById("message").textContent =
+        "Your 30-day access is active until " + new Date(data.paid_until).toLocaleString() + ". Save your API key somewhere secure.";
+      document.getElementById("api-key").textContent = data.api_key;
+      document.getElementById("api-key").style.display = "block";
+      document.getElementById("key-note").textContent = "This key is shown only on this private order link.";
+      return;
+    }}
+  }} catch (error) {{
+    document.getElementById("message").textContent = "Could not check payment status. Refresh this page to try again.";
+    return;
+  }}
+  attempts += 1;
+  if (attempts < 20) {{
+    document.getElementById("message").textContent = "Waiting for final provider confirmation. Checking again shortly.";
+    window.setTimeout(loadAccess, 3000);
+  }} else {{
+    document.getElementById("message").textContent = "Payment is not confirmed yet. Refresh this page later; the redirect itself is not proof of payment.";
+  }}
+}}
+loadAccess();
+</script>
+</body></html>""", headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
-ADMIN_KEY = os.environ.get("TOOLPIPE_ADMIN_KEY", "tp-admin-2026")
+ADMIN_KEY = os.environ.get("TOOLPIPE_ADMIN_KEY", "")
 
 # Public RPC endpoints for on-chain verification (no API key needed)
 CHAIN_RPC = {
@@ -4080,109 +4474,20 @@ class VerifyPaymentRequest(BaseModel):
     admin_key: str = ""
 
 
-class SelfVerifyRequest(BaseModel):
-    order_id: str
-    tx_hash: str
-
-
 @app.post("/payments/verify-tx")
-async def self_verify_payment(req: SelfVerifyRequest):
-    """Self-service payment verification. Submit your tx hash and we verify on-chain."""
-    if not req.tx_hash or len(req.tx_hash) < 32:
-        raise HTTPException(status_code=400, detail="Invalid transaction hash.")
-    # EVM hashes: 0x + 64 hex chars. Solana hashes: 43-88 base58 chars.
-    is_evm_hash = req.tx_hash.startswith("0x") and len(req.tx_hash) == 66
-    is_solana_hash = not req.tx_hash.startswith("0x") and 43 <= len(req.tx_hash) <= 88
-    if not is_evm_hash and not is_solana_hash:
-        raise HTTPException(status_code=400, detail="Invalid transaction hash. EVM: 0x + 64 hex chars. Solana: 43-88 base58 chars.")
-
-    # Check order exists and is pending
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        row = conn.execute(
-            "SELECT email, tier, amount, status FROM payments WHERE order_id = ?", (req.order_id,)
-        ).fetchone()
-        conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if row[3] == "paid":
-        return {"status": "already_paid", "order_id": req.order_id, "message": "This order is already verified and active."}
-
-    email, tier, amount, _ = row
-
-    # Verify on-chain
-    chain_result = await verify_tx_onchain(req.tx_hash)
-
-    if not chain_result.get("verified"):
-        return {
-            "status": "unverified",
-            "order_id": req.order_id,
-            "message": "Transaction not found or not confirmed yet. Try again in a few minutes, or check the tx hash.",
-            "chain_result": chain_result,
-        }
-
-    # Check amount (allow 10% underpayment tolerance for price fluctuations)
-    is_stablecoin = chain_result.get("type") == "token_transfer"
-    is_native = chain_result.get("type") == "native_transfer"
-
-    if is_stablecoin:
-        tx_value_usd = chain_result.get("amount", 0)
-    elif is_native:
-        native_amount = chain_result.get("value_native", 0)
-        chain_name = chain_result.get("chain", "")
-        if chain_name == "solana":
-            native_price = await get_sol_price_usd()
-            chain_result["sol_price_usd"] = native_price
-        else:
-            native_price = await get_eth_price_usd()
-            chain_result["eth_price_usd"] = native_price
-        tx_value_usd = native_amount * native_price if native_price > 0 else 0
-        chain_result["value_usd"] = round(tx_value_usd, 2)
-    else:
-        tx_value_usd = 0
-
-    if tx_value_usd < amount * 0.9:
-        underpaid_resp = {
-            "status": "underpaid",
-            "order_id": req.order_id,
-            "expected_usd": amount,
-            "received_usd": round(tx_value_usd, 2),
-            "message": f"Payment amount ${tx_value_usd:.2f} is below the required ${amount:.2f}. Please send the remaining amount.",
-        }
-        if is_native:
-            underpaid_resp["native_price_used"] = chain_result.get("eth_price_usd") or chain_result.get("sol_price_usd", 0)
-            underpaid_resp["native_received"] = chain_result.get("value_native", 0)
-        return underpaid_resp
-
-    # Payment verified, upgrade the user
-    now = datetime.now(timezone.utc).isoformat()
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        conn.execute(
-            "UPDATE payments SET status = 'paid', paid_at = ?, callback_data = ? WHERE order_id = ?",
-            (now, json.dumps({"tx_hash": req.tx_hash, "chain_verification": chain_result, "auto_verified": True}), req.order_id)
-        )
-        conn.commit()
-        conn.close()
-
-    result = upgrade_api_key(email, tier)
-    return {
-        "status": "verified",
-        "order_id": req.order_id,
-        "email": email,
-        "tier": tier,
-        "api_key": result.get("api_key"),
-        "chain": chain_result.get("chain"),
-        "tx_hash": req.tx_hash,
-        "message": f"Payment verified on {chain_result.get('chain', 'blockchain')}! Your API key has been upgraded to {tier}.",
-    }
+async def self_verify_payment():
+    raise HTTPException(
+        status_code=503,
+        detail="Direct wallet verification is disabled. Hosted payments are activated only by signed provider webhooks.",
+    )
 
 
 @app.post("/payments/verify")
 async def verify_payment(req: VerifyPaymentRequest):
     """Admin endpoint to manually verify a direct crypto payment and upgrade the user."""
-    if req.admin_key != ADMIN_KEY:
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="Admin actions are disabled until TOOLPIPE_ADMIN_KEY is configured.")
+    if not hmac.compare_digest(req.admin_key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Invalid admin key")
     now = datetime.now(timezone.utc).isoformat()
     with _payments_lock:
@@ -4200,14 +4505,16 @@ async def verify_payment(req: VerifyPaymentRequest):
         )
         conn.commit()
         conn.close()
-    result = upgrade_api_key(email, tier)
+    result = grant_paid_access(email, tier, req.order_id)
     return {"verified": True, "order_id": req.order_id, "email": email, "tier": tier, "api_key": result.get("api_key")}
 
 
 @app.get("/payments/pending")
 async def list_pending_payments(key: str = ""):
     """Admin endpoint to list all pending payments awaiting verification."""
-    if key != ADMIN_KEY:
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="Admin actions are disabled until TOOLPIPE_ADMIN_KEY is configured.")
+    if not hmac.compare_digest(key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Invalid admin key")
     with _payments_lock:
         conn = sqlite3.connect(str(PAYMENTS_DB))
@@ -4224,12 +4531,12 @@ async def payment_status(order_id: str = "", track_id: str = ""):
         conn = sqlite3.connect(str(PAYMENTS_DB))
         if order_id:
             row = conn.execute(
-                "SELECT order_id, email, tier, amount, status, created_at, paid_at FROM payments WHERE order_id = ?",
+                "SELECT order_id, tier, amount, status, created_at, paid_at FROM payments WHERE order_id = ?",
                 (order_id,)
             ).fetchone()
         elif track_id:
             row = conn.execute(
-                "SELECT order_id, email, tier, amount, status, created_at, paid_at FROM payments WHERE track_id = ?",
+                "SELECT order_id, tier, amount, status, created_at, paid_at FROM payments WHERE track_id = ?",
                 (track_id,)
             ).fetchone()
         else:
@@ -4239,8 +4546,55 @@ async def payment_status(order_id: str = "", track_id: str = ""):
     if not row:
         raise HTTPException(status_code=404, detail="Payment not found")
     return {
-        "order_id": row[0], "email": row[1], "tier": row[2],
-        "amount": row[3], "status": row[4], "created_at": row[5], "paid_at": row[6]
+        "order_id": row[0], "tier": row[1], "amount": row[2],
+        "status": row[3], "created_at": row[4], "paid_at": row[5]
+    }
+
+
+@app.get("/revenue-dashboard", response_class=HTMLResponse)
+async def revenue_dashboard():
+    dashboard_path = Path(__file__).parent / "static" / "revenue-dashboard.html"
+    return FileResponse(str(dashboard_path), media_type="text/html")
+
+
+@app.get("/api/revenue/summary")
+async def revenue_summary(request: Request):
+    if not REVENUE_DASHBOARD_KEY:
+        raise HTTPException(status_code=503, detail="Set REVENUE_DASHBOARD_KEY to enable the revenue dashboard.")
+    provided_key = request.headers.get("x-revenue-dashboard-key", "")
+    if not hmac.compare_digest(provided_key, REVENUE_DASHBOARD_KEY):
+        raise HTTPException(status_code=401, detail="Invalid dashboard key.")
+
+    with _payments_lock:
+        conn = sqlite3.connect(str(PAYMENTS_DB))
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*), COALESCE(SUM(amount), 0), MAX(paid_at)
+                   FROM payments
+                   WHERE lower(status) = 'paid' AND upper(COALESCE(currency, 'USD')) = 'USD'"""
+            ).fetchone()
+            recent = conn.execute(
+                """SELECT tier, amount, currency, paid_at
+                   FROM payments
+                   WHERE lower(status) = 'paid' AND upper(COALESCE(currency, 'USD')) = 'USD'
+                   ORDER BY paid_at DESC LIMIT 10"""
+            ).fetchall()
+        finally:
+            conn.close()
+
+    payment_count, recorded_revenue, updated_at = row
+    revenue = round(float(recorded_revenue), 2)
+    return {
+        "target_usd": REVENUE_TARGET_USD,
+        "recorded_revenue_usd": revenue,
+        "remaining_usd": round(max(0, REVENUE_TARGET_USD - revenue), 2),
+        "progress_percent": round(revenue / REVENUE_TARGET_USD * 100, 4),
+        "payment_count": payment_count,
+        "updated_at": updated_at,
+        "recent_payments": [
+            {"tier": tier, "amount": round(float(amount), 2), "currency": currency or "USD", "paid_at": paid_at}
+            for tier, amount, currency, paid_at in recent
+        ],
     }
 
 
@@ -4296,56 +4650,18 @@ async def list_credit_packs():
         "packs": CREDIT_PACKS,
         "how_it_works": "1 credit = 1 premium API call. Buy credits, then use your API key. Credits never expire.",
         "payment": {
-            "crypto_wallets": {
-                "ETH/ERC-20": WALLET_ADDRESS,
-                "Solana": SOLANA_WALLET,
-            },
-            "flow": "POST /api/credits/buy -> send crypto -> POST /api/credits/verify with tx_hash",
+            "available": False,
+            "message": "Credit purchases are disabled until provider-backed credit fulfillment is implemented.",
         },
     }
 
 
 @app.post("/api/credits/buy")
-async def buy_credits(req: CreditPurchaseRequest, request: Request):
-    """Purchase API credits. Returns payment instructions."""
-    if req.pack not in CREDIT_PACKS:
-        raise HTTPException(status_code=400, detail=f"Invalid pack. Options: {', '.join(CREDIT_PACKS.keys())}")
-
-    pack = CREDIT_PACKS[req.pack]
-    order_id = f"cr-{req.pack}-{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-    email = req.email.strip().lower() if req.email else "agent@toolpipe.dev"
-
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        conn.execute(
-            "INSERT INTO credit_purchases (api_key, pack, credits, amount, order_id, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (req.api_key, req.pack, pack["credits"], pack["amount"], order_id, now)
-        )
-        # Ensure credit account exists
-        existing = conn.execute("SELECT api_key FROM credits WHERE api_key = ?", (req.api_key,)).fetchone()
-        if not existing:
-            conn.execute(
-                "INSERT INTO credits (api_key, email, balance, total_purchased, total_used, created_at, updated_at) VALUES (?, ?, 0, 0, 0, ?, ?)",
-                (req.api_key, email, now, now)
-            )
-        conn.commit()
-        conn.close()
-
-    return {
-        "order_id": order_id,
-        "pack": req.pack,
-        "credits": pack["credits"],
-        "amount_usd": pack["amount"],
-        "payment_instructions": {
-            "send_to": {
-                "ETH/USDC/USDT (any EVM chain)": WALLET_ADDRESS,
-                "SOL/USDC-SPL (Solana)": SOLANA_WALLET,
-            },
-            "amount": f"${pack['amount']}",
-            "then": f"POST /api/credits/verify with order_id={order_id} and your tx_hash",
-        },
-    }
+async def buy_credits(req: CreditPurchaseRequest):
+    raise HTTPException(
+        status_code=503,
+        detail="Credit purchases are disabled until provider-backed credit fulfillment is implemented.",
+    )
 
 
 class CreditVerifyRequest(BaseModel):
@@ -4355,66 +4671,10 @@ class CreditVerifyRequest(BaseModel):
 
 @app.post("/api/credits/verify")
 async def verify_credit_purchase(req: CreditVerifyRequest):
-    """Verify crypto payment and add credits to your account."""
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        row = conn.execute(
-            "SELECT api_key, pack, credits, amount, status FROM credit_purchases WHERE order_id = ?",
-            (req.order_id,)
-        ).fetchone()
-        conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if row[4] == "verified":
-        return {"status": "already_verified", "order_id": req.order_id}
-
-    api_key, pack, credits, amount, _ = row
-
-    chain_result = await verify_tx_onchain(req.tx_hash)
-    if not chain_result.get("verified"):
-        return {"status": "unverified", "message": "Transaction not found or pending. Try again in a few minutes.", "chain_result": chain_result}
-
-    # Verify amount
-    is_stablecoin = chain_result.get("type") == "token_transfer"
-    is_native = chain_result.get("type") == "native_transfer"
-    if is_stablecoin:
-        tx_value_usd = chain_result.get("amount", 0)
-    elif is_native:
-        native_amount = chain_result.get("value_native", 0)
-        if chain_result.get("chain") == "solana":
-            native_price = await get_sol_price_usd()
-        else:
-            native_price = await get_eth_price_usd()
-        tx_value_usd = native_amount * native_price if native_price > 0 else 0
-    else:
-        tx_value_usd = 0
-
-    if tx_value_usd < amount * 0.9:
-        return {"status": "underpaid", "expected_usd": amount, "received_usd": round(tx_value_usd, 2)}
-
-    now = datetime.now(timezone.utc).isoformat()
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        conn.execute(
-            "UPDATE credit_purchases SET status = 'verified', tx_hash = ?, verified_at = ? WHERE order_id = ?",
-            (req.tx_hash, now, req.order_id)
-        )
-        conn.execute(
-            "UPDATE credits SET balance = balance + ?, total_purchased = total_purchased + ?, updated_at = ? WHERE api_key = ?",
-            (credits, credits, now, api_key)
-        )
-        conn.commit()
-        new_balance = conn.execute("SELECT balance FROM credits WHERE api_key = ?", (api_key,)).fetchone()
-        conn.close()
-
-    return {
-        "status": "verified",
-        "credits_added": credits,
-        "new_balance": new_balance[0] if new_balance else credits,
-        "order_id": req.order_id,
-        "chain": chain_result.get("chain"),
-    }
+    raise HTTPException(
+        status_code=503,
+        detail="Credit purchases are disabled until provider-backed credit fulfillment is implemented.",
+    )
 
 
 @app.get("/api/credits/balance")
@@ -4443,7 +4703,7 @@ async def checkout_page(tier: str = "pro"):
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Checkout - ToolPipe {name}</title>
-<meta name="description" content="Upgrade to ToolPipe {name}: {limit:,} API calls/day for ${amount}/month. Pay with crypto, no KYC required.">
+<meta name="description" content="Upgrade to ToolPipe {name}: {limit:,} API calls/day for 30 days with hosted provider checkout.">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
@@ -4461,95 +4721,44 @@ input:focus{{border-color:#6c63ff}}
 .btn{{width:100%;padding:14px;background:#6c63ff;color:#fff;border:none;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer;transition:background 0.2s}}
 .btn:hover{{background:#5b54e6}}
 .btn:disabled{{background:#333;cursor:not-allowed}}
-.addresses{{background:#0a0a0a;border-radius:8px;padding:16px;margin:16px 0}}
-.addr{{margin:8px 0}}
-.addr-label{{color:#64748b;font-size:0.8rem}}
-.addr-value{{color:#6c63ff;font-family:monospace;font-size:0.8rem;word-break:break-all;cursor:pointer}}
-.addr-value:hover{{color:#8b85ff}}
-.notice{{background:#1a1a1a;border-left:3px solid #6c63ff;padding:12px 16px;margin:16px 0;border-radius:0 8px 8px 0;font-size:0.85rem;color:#94a3b8}}
-.success{{text-align:center;padding:20px 0}}
-.success h2{{color:#22c55e;margin-bottom:8px}}
-.key{{background:#0a0a0a;padding:12px;border-radius:8px;font-family:monospace;color:#6c63ff;word-break:break-all;margin:12px 0}}
 .spinner{{display:inline-block;width:20px;height:20px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;vertical-align:middle;margin-right:8px}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
-.back{{color:#64748b;font-size:0.85rem;cursor:pointer;margin-top:12px;display:inline-block}}
-.back:hover{{color:#94a3b8}}
 .powered{{text-align:center;padding:16px;color:#333;font-size:0.75rem}}
 .powered a{{color:#444}}
 </style></head><body>
 <div class="checkout">
 <div class="header">
 <h1>ToolPipe {name}</h1>
-<div class="price">${amount}<span>/month</span></div>
+<div class="price">${amount}<span>/30 days</span></div>
 <div class="features">{limit:,} API calls/day &middot; All 200+ endpoints &middot; Priority support</div>
 </div>
 <div class="body">
 <div id="step1" class="step active">
 <label>Email address</label>
 <input type="email" id="email" placeholder="you@example.com" autofocus>
+<label>Current API key (only if this email already has an account)</label>
+<input type="password" id="apiKey" autocomplete="off" placeholder="tp_...">
 <button class="btn" onclick="createOrder()" id="orderBtn">Continue to Payment</button>
 </div>
-<div id="step2" class="step">
-<div class="notice">Send <strong>${amount}</strong> in any supported cryptocurrency to one of the addresses below. USDC on Base has the lowest gas fees (~$0.01).</div>
-<div class="addresses">
-<div class="addr"><div class="addr-label">EVM (Ethereum, Polygon, Base, Arbitrum, Optimism, BSC)</div><div class="addr-value" onclick="copyAddr(this)">{WALLET_ADDRESS}</div></div>
-<div class="addr"><div class="addr-label">Solana (SOL, USDC-SPL)</div><div class="addr-value" onclick="copyAddr(this)">{SOLANA_WALLET}</div></div>
+<p id="checkoutError" role="alert" style="color:#f87171;min-height:1.4em"></p>
 </div>
-<p style="color:#64748b;font-size:0.8rem;margin-bottom:4px">Accepted: ETH, USDC, USDT, DAI, SOL, BNB, AVAX, any ERC-20</p>
-<p style="color:#64748b;font-size:0.8rem;margin-bottom:16px">Order: <code id="orderId" style="color:#6c63ff"></code></p>
-<label>Transaction hash (after sending)</label>
-<input type="text" id="txHash" placeholder="0x... or Solana tx hash">
-<button class="btn" onclick="verifyPayment()" id="verifyBtn">Verify Payment</button>
-<div class="back" onclick="showStep(1)">Back</div>
-</div>
-<div id="step3" class="step">
-<div class="success">
-<h2>Payment Verified!</h2>
-<p style="color:#94a3b8">Your API key has been upgraded to {name}.</p>
-<div class="key" id="apiKey"></div>
-<p style="color:#64748b;font-size:0.85rem">Save this key. Use it with X-API-Key header or api_key query parameter.</p>
-<a href="/api-keys" class="btn" style="display:inline-block;text-decoration:none;margin-top:16px;width:auto;padding:12px 32px">View Dashboard</a>
-</div>
-</div>
-<div id="step-error" class="step">
-<div style="text-align:center;padding:20px 0">
-<h2 style="color:#ef4444">Verification Pending</h2>
-<p id="errorMsg" style="color:#94a3b8;margin:8px 0"></p>
-<button class="btn" onclick="showStep(2)" style="margin-top:16px">Try Again</button>
-</div>
-</div>
-</div>
-<div class="powered">Powered by <a href="/">ToolPipe</a> &middot; Crypto payments, no KYC</div>
+<div class="powered">Powered by <a href="/">ToolPipe</a> &middot; Hosted crypto checkout</div>
 </div>
 <script>
-let currentOrderId='';
-function showStep(n){{document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));document.getElementById(n==='error'?'step-error':'step'+n).classList.add('active')}}
-function copyAddr(el){{navigator.clipboard.writeText(el.textContent);el.style.color='#22c55e';setTimeout(()=>el.style.color='',1500)}}
 async function createOrder(){{
   const email=document.getElementById('email').value.trim();
-  if(!email||!email.includes('@')){{alert('Valid email required');return}}
+  const error=document.getElementById('checkoutError');
+  if(!email||!email.includes('@')){{error.textContent='Valid email required.';return}}
+  error.textContent='';
   const btn=document.getElementById('orderBtn');btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Creating...';
   try{{
-    const r=await fetch('/payments/create',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{email,tier:'{tier}'}})}});
+    const r=await fetch('/payments/create',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{email,tier:'{tier}',api_key:document.getElementById('apiKey').value.trim()}})}});
     const d=await r.json();
-    if(d.payment_url&&d.gateway!=='direct_crypto'){{window.location.href=d.payment_url;return}}
-    currentOrderId=d.order_id;
-    document.getElementById('orderId').textContent=d.order_id;
-    showStep(2);
-  }}catch(e){{alert('Error: '+e.message)}}
+    if(!r.ok)throw new Error(d.detail||'Could not create a payment.');
+    if(!d.payment_url)throw new Error('The payment provider did not return a checkout URL.');
+    window.location.assign(d.payment_url);return;
+  }}catch(e){{error.textContent='Payment unavailable: '+e.message}}
   btn.disabled=false;btn.textContent='Continue to Payment';
-}}
-async function verifyPayment(){{
-  const txHash=document.getElementById('txHash').value.trim();
-  if(!txHash){{alert('Enter transaction hash');return}}
-  const btn=document.getElementById('verifyBtn');btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Verifying on-chain...';
-  try{{
-    const r=await fetch('/payments/verify-tx',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{order_id:currentOrderId,tx_hash:txHash}})}});
-    const d=await r.json();
-    if(d.status==='verified'){{document.getElementById('apiKey').textContent=d.api_key;showStep(3)}}
-    else{{document.getElementById('errorMsg').textContent=d.message||'Transaction not confirmed yet. Try again in a few minutes.';showStep('error')}}
-  }}catch(e){{document.getElementById('errorMsg').textContent=e.message;showStep('error')}}
-  btn.disabled=false;btn.textContent='Verify Payment';
 }}
 </script>
 </body></html>""")
@@ -4628,79 +4837,48 @@ class AgentPayRequest(BaseModel):
     email: str
     tier: str = "pro"
     preferred_chain: str = "base"  # base, polygon, arbitrum, ethereum, optimism, solana
+    api_key: str = ""
 
 
 @app.post("/payments/agent-pay")
-async def agent_pay(req: AgentPayRequest, request: Request):
+async def agent_pay(req: AgentPayRequest):
     """
-    Agent-optimized payment endpoint. Returns everything an AI agent needs
-    to pay for API access in a single call. Designed for MCP tool use.
-
-    Flow: 1) Call this endpoint -> 2) Send crypto -> 3) POST /payments/verify-tx
+    Agent-optimized hosted checkout. Payment activation is handled only by
+    the configured provider's signed webhook.
     """
     email = req.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email required")
+    _validate_checkout_owner(email, req.api_key)
     tier = req.tier.lower()
     if tier not in PRICING_TIERS:
         raise HTTPException(status_code=400, detail=f"Invalid tier: {', '.join(PRICING_TIERS.keys())}")
 
     tier_info = PRICING_TIERS[tier]
-    order_id = f"tp-{tier}-{uuid.uuid4().hex[:12]}"
+    order_id = f"tp-{tier}-{uuid.uuid4().hex}"
     amount = tier_info["amount"]
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Record the order
-    with _payments_lock:
-        conn = sqlite3.connect(str(PAYMENTS_DB))
-        conn.execute(
-            "INSERT OR REPLACE INTO payments (track_id, order_id, email, tier, amount, status, created_at) VALUES (?, ?, ?, ?, ?, 'awaiting_direct', ?)",
-            (order_id, order_id, email, tier, amount, now)
+    if not OXAPAY_MERCHANT_KEY and not (
+        NOWPAYMENTS_API_KEY and NOWPAYMENTS_IPN_SECRET
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="No payment provider with verified webhook credentials is configured.",
         )
-        conn.commit()
-        conn.close()
-
-    chain = req.preferred_chain.lower()
-
-    # Get current ETH price for amount calculation
-    eth_price = await get_eth_price_usd()
-    eth_amount = round(amount / eth_price, 6) if eth_price > 0 else None
-
-    response = {
-        "order_id": order_id,
+    base_url = _payment_public_base_url()
+    result = await create_payment_invoice(
+        amount,
+        email,
+        tier,
+        order_id,
+        f"{base_url}/payments/webhook",
+        f"{base_url}/payments/success?order_id={order_id}",
+    )
+    return {
+        **result,
         "amount_usd": amount,
         "tier": tier,
         "daily_limit": tier_info["daily_limit"],
-        "payment_instructions": {
-            "evm": {
-                "address": WALLET_ADDRESS,
-                "networks": ["ethereum", "polygon", "arbitrum", "base", "optimism"],
-                "recommended_network": chain if chain != "solana" else "base",
-                "accepted_tokens": ["USDC", "USDT", "DAI", "ETH", "WETH"],
-                "recommended_token": "USDC",
-                "stablecoin_amount": amount,
-            },
-        },
-        "verification": {
-            "endpoint": "POST /payments/verify-tx",
-            "body": {"order_id": order_id, "tx_hash": "<your_tx_hash>"},
-            "result": "API key returned instantly on successful verification",
-        },
-        "notes": "Send any supported token on any supported network. USDC on Base has lowest gas fees (~$0.01). After sending, POST your tx_hash to /payments/verify-tx for instant upgrade.",
     }
-
-    if eth_amount:
-        response["payment_instructions"]["evm"]["eth_amount"] = eth_amount
-        response["payment_instructions"]["evm"]["eth_price_usd"] = eth_price
-
-    if SOLANA_WALLET:
-        response["payment_instructions"]["solana"] = {
-            "address": SOLANA_WALLET,
-            "accepted_tokens": ["SOL", "USDC-SPL"],
-            "stablecoin_amount": amount,
-        }
-
-    return response
 
 
 # Update verify-tx to also check Solana
@@ -4729,7 +4907,7 @@ async def pricing_page_v2():
     return HTMLResponse(inject_snippet("""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>ToolPipe Pricing - API Plans for Developers & AI Agents</title>
-<meta name="description" content="ToolPipe API pricing: Free tier (100 calls/day), Pro ($9.99/mo, 10K calls/day), Enterprise ($49.99/mo, 100K calls/day). Pay with crypto. No KYC.">
+<meta name="description" content="ToolPipe API pricing: Free tier (100 calls/day), Pro ($9.99 per 30 days), Enterprise ($49.99 per 30 days). Paid plans use hosted provider checkout.">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0}
@@ -4768,7 +4946,7 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 </style></head><body>
 <div class="container">
 <h1>Simple, Transparent Pricing</h1>
-<p class="sub">175+ developer APIs. Pay with crypto. No KYC needed.</p>
+<p class="sub">175+ developer APIs. Paid plans use hosted provider checkout.</p>
 
 <div class="tiers">
 <div class="tier">
@@ -4788,8 +4966,8 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 <div class="tier featured">
 <div class="badge">Most Popular</div>
 <h2>Pro</h2>
-<div class="price">$9.99 <span>/mo</span></div>
-<div class="period">Billed monthly via crypto</div>
+<div class="price">$9.99 <span>/30 days</span></div>
+<div class="period">One payment grants 30 days; renew manually</div>
 <ul>
 <li>10,000 requests/day</li>
 <li>All 230+ endpoints</li>
@@ -4804,7 +4982,7 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 
 <div class="tier">
 <h2>Enterprise</h2>
-<div class="price">$49.99 <span>/mo</span></div>
+<div class="price">$49.99 <span>/30 days</span></div>
 <div class="period">For high-volume users & AI agents</div>
 <ul>
 <li>100,000 requests/day</li>
@@ -4822,7 +5000,7 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 
 <div class="crypto-note">
 <h3>Pay with Crypto</h3>
-<p>We accept BTC, ETH, USDT, USDC, SOL, TON, DOGE, LTC, and 20+ cryptocurrencies via OxaPay. No KYC, no bank account needed. Perfect for AI agents and global developers.</p>
+<p>Customers can pay through hosted crypto checkout when a payment provider account is configured. Available currencies and identity checks depend on the provider.</p>
 </div>
 
 <div class="faq">
@@ -4847,15 +5025,11 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 <div style="background:#1a1a1a;border:2px solid #6c63ff;border-radius:16px;padding:32px;max-width:420px;width:90%;position:relative">
 <button onclick="closeModal()" style="position:absolute;top:12px;right:16px;background:none;border:none;color:#fff;font-size:1.5rem;cursor:pointer">x</button>
 <h2 style="color:#fff;margin-bottom:4px" id="modal-title">Upgrade to Pro</h2>
-<p style="color:#94a3b8;margin-bottom:20px" id="modal-price">$9.99/month</p>
+<p style="color:#94a3b8;margin-bottom:20px" id="modal-price">$9.99 / 30 days</p>
 <input type="email" id="pay-email" placeholder="your@email.com" style="width:100%;background:#111;border:1px solid #2a2a2a;color:#e0e0e0;padding:12px;border-radius:8px;font-size:1rem;margin-bottom:12px">
+<input type="password" id="pay-api-key" autocomplete="off" placeholder="Current API key (for an existing account)" style="width:100%;background:#111;border:1px solid #2a2a2a;color:#e0e0e0;padding:12px;border-radius:8px;font-size:1rem;margin-bottom:12px">
 <button id="pay-btn" onclick="submitPayment()" style="width:100%;background:#6c63ff;color:#fff;border:none;padding:14px;border-radius:8px;font-weight:600;font-size:1rem;cursor:pointer">Pay with Crypto</button>
 <p id="pay-status" style="color:#94a3b8;margin-top:12px;font-size:0.9rem;text-align:center;display:none"></p>
-<div style="margin-top:16px;padding-top:16px;border-top:1px solid #2a2a2a">
-<p style="color:#64748b;font-size:0.8rem;text-align:center">Or send crypto directly:</p>
-<p style="color:#22c55e;font-family:monospace;font-size:0.75rem;text-align:center;word-break:break-all;margin-top:4px">0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6</p>
-<p style="color:#64748b;font-size:0.75rem;text-align:center;margin-top:4px">Then email toolpipe-ads@sharebot.net with tx hash</p>
-</div>
 </div>
 </div>
 
@@ -4863,7 +5037,7 @@ h1{font-size:2.5rem;color:#fff;text-align:center;margin-bottom:8px}
 let selectedTier = 'pro';
 function buyPlan(tier) {
     selectedTier = tier;
-    const prices = {pro: '$9.99/month', enterprise: '$49.99/month'};
+    const prices = {pro: '$9.99 / 30 days', enterprise: '$49.99 / 30 days'};
     const titles = {pro: 'Upgrade to Pro', enterprise: 'Get Enterprise'};
     document.getElementById('modal-title').textContent = titles[tier];
     document.getElementById('modal-price').textContent = prices[tier];
@@ -4885,41 +5059,18 @@ async function submitPayment() {
         const res = await fetch('/payments/create', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({email, tier: selectedTier})
+            body: JSON.stringify({
+                email,
+                tier: selectedTier,
+                api_key: document.getElementById('pay-api-key').value.trim()
+            })
         });
         const data = await res.json();
-        if (data.success && data.payment_url) {
-            window.location.href = data.payment_url;
-        } else if (data.success && data.payment_method === 'crypto_direct') {
-            const addr = data.primary_address;
-            const amt = data.amount_usd;
-            const oid = data.order_id;
-            const qr = data.qr_code_url;
-            status.innerHTML = '<div style="text-align:center">' +
-              '<strong style="font-size:1.1rem;color:#22c55e">Send Crypto to Complete Payment</strong><br><br>' +
-              '<img src="' + qr + '" alt="QR Code" style="width:200px;height:200px;border-radius:8px;margin:8px auto;display:block;background:#fff;padding:8px"><br>' +
-              '<code style="color:#22c55e;word-break:break-all;font-size:0.85rem;background:#111;padding:8px 12px;border-radius:6px;display:block;margin:8px 0">' + addr + '</code>' +
-              '<p style="margin:8px 0;color:#e0e0e0">Amount: <strong>$' + amt + '</strong> in ETH, USDC, USDT, or any ERC-20</p>' +
-              '<p style="color:#94a3b8;font-size:0.85rem">Networks: Ethereum, Polygon, Arbitrum, Base, Optimism</p>' +
-              '<p style="margin-top:12px;padding:12px;background:#1a1a2e;border-radius:8px;border:1px solid #6c63ff44">' +
-              '<div style="margin-top:12px"><input id="verify-tx-hash" placeholder="Paste your tx hash (0x...)" style="width:100%;background:#111;border:1px solid #2a2a2a;color:#e0e0e0;padding:10px;border-radius:6px;font-size:0.85rem;font-family:monospace;margin-bottom:8px">' +
-              '<button onclick="verifyTx(\\''+oid+'\\',document.getElementById(\\'verify-tx-hash\\').value)" style="width:100%;background:#22c55e;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer">Verify Payment On-Chain</button>' +
-              '<p id="verify-result" style="margin-top:8px;font-size:0.85rem;text-align:center"></p></div>' +
-              '<p style="margin-top:8px;color:#64748b;font-size:0.75rem;text-align:center">Or email <a href="mailto:toolpipe-ads@sharebot.net?subject=Payment%20' + oid + '" style="color:#6c63ff">toolpipe-ads@sharebot.net</a> with tx hash</p>' +
-              '</div>';
-            status.style.color = '#e0e0e0';
-            status.style.display = 'block';
-            btn.textContent = 'Payment Address Ready';
-            btn.disabled = true;
-        } else {
-            status.textContent = data.error || 'Payment creation failed.';
-            status.style.color = '#ef4444';
-            status.style.display = 'block';
-            btn.textContent = 'Pay with Crypto';
-            btn.disabled = false;
-        }
+        if (!res.ok) throw new Error(data.detail || 'Payment creation failed.');
+        if (!data.payment_url) throw new Error('The payment provider did not return a checkout URL.');
+        window.location.assign(data.payment_url);
     } catch(e) {
-        status.textContent = 'Network error. Try the direct crypto address below.';
+        status.textContent = 'Payment unavailable: ' + e.message;
         status.style.color = '#ef4444';
         status.style.display = 'block';
         btn.textContent = 'Pay with Crypto';
@@ -4929,35 +5080,6 @@ async function submitPayment() {
 document.getElementById('pay-modal').addEventListener('click', function(e) {
     if (e.target === this) closeModal();
 });
-async function verifyTx(orderId, txHash) {
-    const result = document.getElementById('verify-result');
-    if (!txHash || !txHash.startsWith('0x') || txHash.length !== 66) {
-        result.textContent = 'Enter a valid tx hash (0x + 64 hex chars)';
-        result.style.color = '#ef4444';
-        return;
-    }
-    result.textContent = 'Checking on-chain (may take 10-20s)...';
-    result.style.color = '#94a3b8';
-    try {
-        const res = await fetch('/payments/verify-tx', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({order_id: orderId, tx_hash: txHash})
-        });
-        const data = await res.json();
-        if (data.status === 'verified') {
-            result.innerHTML = '<strong style="color:#22c55e">Payment verified! Your API key: ' + data.api_key + '</strong><br><a href="/api-keys" style="color:#6c63ff">View Dashboard</a>';
-        } else if (data.status === 'already_paid') {
-            result.innerHTML = '<strong style="color:#22c55e">Already verified!</strong> <a href="/api-keys" style="color:#6c63ff">Dashboard</a>';
-        } else {
-            result.textContent = data.message || 'Not verified yet. Try again in a few minutes.';
-            result.style.color = '#f59e0b';
-        }
-    } catch(e) {
-        result.textContent = 'Network error. Try again.';
-        result.style.color = '#ef4444';
-    }
-}
 </script>
 </body></html>"""))
 
@@ -5034,13 +5156,20 @@ h2{font-size:1.3rem;color:#fff;margin:40px 0 16px;text-align:center}
 <div class="section">
 <div class="section-title">Pay with Crypto <span style="display:inline-block;background:#22c55e22;color:#22c55e;padding:2px 10px;border-radius:12px;font-size:0.75rem;font-weight:600;margin-left:8px;">LIVE</span></div>
 <p style="color:#94a3b8;font-size:0.95rem;margin-bottom:16px;">Send crypto directly to our wallet. All major ERC-20 tokens accepted on the same address.</p>
-<div style="background:#111;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:16px">
+<div data-wallet-address="__EVM_WALLET_ADDRESS__" style="background:#111;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:16px">
 <div style="color:#fff;font-weight:600;margin-bottom:8px;">Ethereum / USDC / USDT / ERC-20 Tokens</div>
 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-<code style="background:#0a0a0a;color:#22c55e;padding:8px 12px;border-radius:6px;font-size:0.85rem;word-break:break-all;flex:1">0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6</code>
-<button onclick="navigator.clipboard.writeText('0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)" style="background:#6c63ff;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap">Copy</button>
+<code style="background:#0a0a0a;color:#22c55e;padding:8px 12px;border-radius:6px;font-size:0.85rem;word-break:break-all;flex:1">__EVM_WALLET_ADDRESS__</code>
+<button onclick="navigator.clipboard.writeText(this.closest('[data-wallet-address]').dataset.walletAddress);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)" style="background:#6c63ff;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap">Copy</button>
 </div>
 <p style="color:#64748b;font-size:0.8rem;margin-top:8px;">Supports: ETH, USDC, USDT, DAI, and any ERC-20 token on Ethereum mainnet, Polygon, Arbitrum, Base, or Optimism.</p>
+</div>
+<div data-wallet-address="__SOLANA_WALLET_ADDRESS__" style="background:#111;border:1px solid #8b5cf6;border-radius:12px;padding:16px;margin-bottom:16px">
+<div style="color:#fff;font-weight:600;margin-bottom:8px;">Solana (SOL, USDC-SPL)</div>
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+<code style="background:#0a0a0a;color:#8b5cf6;padding:8px 12px;border-radius:6px;font-size:0.85rem;word-break:break-all;flex:1">__SOLANA_WALLET_ADDRESS__</code>
+<button onclick="navigator.clipboard.writeText(this.closest('[data-wallet-address]').dataset.walletAddress);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)" style="background:#6c63ff;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap">Copy</button>
+</div>
 </div>
 <div style="background:#111;border:1px solid #2a2a2a;border-radius:12px;padding:16px">
 <p style="color:#94a3b8;font-size:0.9rem;">After sending, email <a href="mailto:toolpipe-ads@sharebot.net" style="color:#6c63ff">toolpipe-ads@sharebot.net</a> with your tx hash to receive Pro API access.</p>
@@ -5211,8 +5340,8 @@ async def mcp_info():
         },
         "pricing": {
             "free": {"daily_limit": 100, "signup": "email only"},
-            "pro": {"price": "$9.99/mo", "daily_limit": 10000, "payment": "crypto"},
-            "enterprise": {"price": "$49.99/mo", "daily_limit": 100000, "payment": "crypto"},
+            "pro": {"price": "$9.99 per 30 days", "daily_limit": 10000, "payment": "hosted provider checkout"},
+            "enterprise": {"price": "$49.99 per 30 days", "daily_limit": 100000, "payment": "hosted provider checkout"},
         },
     }
 
@@ -5323,8 +5452,8 @@ async def api_info():
         },
         "free_tier": {"daily_limit": 100, "signup": "Email only at /api-keys"},
         "paid_tiers": {
-            "pro": {"price": "$9.99/mo", "daily_limit": 10000},
-            "enterprise": {"price": "$49.99/mo", "daily_limit": 100000}
+            "pro": {"price": "$9.99 per 30 days", "daily_limit": 10000},
+            "enterprise": {"price": "$49.99 per 30 days", "daily_limit": 100000}
         }
     }
 
@@ -7520,7 +7649,7 @@ async def my_ip(request: Request):
 
 # --- Webhook Tester ---
 
-WEBHOOK_DB = Path(__file__).parent / "data" / "webhooks.db"
+WEBHOOK_DB = DATA_DIR / "webhooks.db"
 _webhook_lock = threading.Lock()
 
 def _init_webhook_db():
@@ -7894,9 +8023,8 @@ async def api_stats():
         "total_endpoints": route_count,
         "mcp_tools": 135,
         "uptime_start": datetime.now(timezone.utc).isoformat(),
-        "pricing": {"free": "100 calls/day", "pro": "$9.99/mo (10k calls/day)", "enterprise": "$49.99/mo (100k calls/day)"},
-        "payment_methods": ["ETH", "USDC", "USDT", "DAI", "SOL", "USDC-SPL"],
-        "networks": ["Ethereum", "Polygon", "Arbitrum", "Base", "Optimism", "Solana"],
+        "pricing": {"free": "100 calls/day", "pro": "$9.99 per 30 days (10k calls/day)", "enterprise": "$49.99 per 30 days (100k calls/day)"},
+        "payment_methods": ["Hosted OxaPay or NOWPayments checkout when configured"],
     }
 
 
@@ -11015,7 +11143,7 @@ async def a2a_agent_card():
         },
         "authentication": {
             "schemes": ["apiKey"],
-            "credentials": "Get free API key at POST /api-keys/register with {email}. Free: 100 calls/day. Pro: 10,000 calls/day ($9.99/mo crypto).",
+            "credentials": "Get free API key at POST /api-keys/register with {email}. Free: 100 calls/day. Pro: 10,000 calls/day ($9.99 per 30 days, renew manually).",
         },
         "skills": [
             {"id": "json_tools", "name": "JSON Tools", "description": "Format, validate, minify, diff JSON. Convert JSON to CSV, XML, TypeScript interfaces, SQL schemas."},
@@ -11059,15 +11187,13 @@ async def agent_discover():
             "no_credit_card": True,
         },
         "pro_tier": {
-            "price": "$9.99/month",
+            "price": "$9.99 per 30 days",
             "daily_limit": 10000,
-            "payment": "Crypto only (no KYC). POST /payments/agent-pay",
+            "payment": "One payment grants 30 days; manual renewal. POST /payments/agent-pay",
         },
         "pay_per_call": {
-            "packs": CREDIT_PACKS,
-            "buy": "POST /api/credits/buy with {api_key, pack}",
-            "verify": "POST /api/credits/verify with {order_id, tx_hash}",
-            "balance": "GET /api/credits/balance?api_key=...",
+            "available": False,
+            "message": "Credit purchases are disabled until provider-backed fulfillment is implemented.",
         },
         "popular_tools": [
             {"endpoint": "POST /json/format", "description": "Format/validate/minify JSON"},
@@ -11292,10 +11418,10 @@ async def a2a_discovery():
             "register": f"{base}/api-keys/register",
         },
         "payment": {
-            "crypto": True,
+            "crypto": bool(OXAPAY_MERCHANT_KEY or NOWPAYMENTS_API_KEY or WALLET_ADDRESS or SOLANA_WALLET),
             "wallets": {
-                "ethereum": "0xBCF464909b748d720fd5DDA25ad3d313Dd4b53D6",
-                "solana": "2guKDsPScRpCCKuVEGKBPFvodSNtZF4ArYeSC6oy6pf6",
+                "ethereum": WALLET_ADDRESS or None,
+                "solana": SOLANA_WALLET or None,
             },
             "payment_endpoint": f"{base}/payments/create",
         },
@@ -11709,7 +11835,7 @@ async def openapi_lite():
             "Markdown conversion", "Cron validation", "Webhook testing",
         ],
         "payment": {
-            "method": "crypto (no KYC)",
+            "method": "hosted crypto checkout when a provider is configured",
             "wallets": {
                 "evm": WALLET_ADDRESS,
                 "solana": SOLANA_WALLET,
@@ -11732,4 +11858,4 @@ async def seo_page_handler(page_name: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))

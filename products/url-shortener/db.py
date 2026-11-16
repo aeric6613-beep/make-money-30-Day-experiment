@@ -6,12 +6,13 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_DIR = Path(__file__).parent / "data"
+_DATA_ROOT = os.environ.get("TOOLPIPE_DATA_DIR")
+DB_DIR = Path(_DATA_ROOT) / "url-shortener" if _DATA_ROOT else Path(__file__).parent / "data"
 DB_PATH = DB_DIR / "urls.db"
 
 
 def get_db():
-    DB_DIR.mkdir(exist_ok=True)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

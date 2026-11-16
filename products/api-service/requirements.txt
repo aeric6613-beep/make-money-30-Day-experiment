@@ -9,5 +9,7 @@ beautifulsoup4==4.14.3
 markdown==3.10.2
 pydantic==2.12.5
 httpx==0.28.1
-dnspython==2.8.1
+dnspython==2.9.2
 pyyaml==6.0.2
+pypdf==7.0.1
+reportlab==5.1.0

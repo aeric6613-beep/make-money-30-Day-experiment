@@ -8,7 +8,7 @@
   "apis": [
     {
       "name": "ToolPipe Developer API",
-      "description": "112+ REST API endpoints for developer utilities. Free tier: 100 calls/day. Pro: 10,000 calls/day ($9.99/mo). Pay with crypto, no KYC.",
+      "description": "112+ REST API endpoints for developer utilities. Free tier: 100 calls/day. Pro: 10,000 calls/day ($9.99 per 30 days, manual renewal). Paid plans use hosted provider checkout when configured.",
       "humanURL": "https://toolpipe.dev/docs",
       "baseURL": "https://toolpipe.dev/api",
       "tags": ["developer-tools", "api", "json", "qr-code", "uuid", "hash", "dns", "pdf", "regex", "jwt", "mcp", "ai-tools", "crypto-payments"],

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: toolpipe-api
+    runtime: docker
+    plan: 0.5c-512mb
+    dockerfilePath: products/api-service/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    disk:
+      name: toolpipe-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: TOOLPIPE_DATA_DIR
+        value: /var/data
+      - key: TOOLPIPE_WAITLIST_FILE
+        value: /var/data/waitlist.txt
+      - key: REVENUE_DASHBOARD_KEY
+        sync: false
+      - key: OXAPAY_MERCHANT_KEY
+        sync: false
+      - key: PAYMENTS_PUBLIC_BASE_URL
+        sync: false
