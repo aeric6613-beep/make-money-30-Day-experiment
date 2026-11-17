@@ -21,5 +21,7 @@ services:
         sync: false
       - key: OXAPAY_MERCHANT_KEY
         sync: false
+      - key: OXAPAY_SANDBOX
+        value: "true"
       - key: PAYMENTS_PUBLIC_BASE_URL
         sync: false
