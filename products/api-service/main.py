@@ -540,6 +540,7 @@ def check_api_key(key: str) -> dict | None:
 # --- Crypto Payment Gateway Integration ---
 # OxaPay Merchant API (primary gateway)
 OXAPAY_MERCHANT_KEY = os.environ.get("OXAPAY_MERCHANT_KEY", "").strip()
+OXAPAY_SANDBOX = os.environ.get("OXAPAY_SANDBOX", "").strip().lower() == "true"
 OXAPAY_API_URL = "https://api.oxapay.com/v1/payment/invoice"
 # NOWPayments (alternate gateway)
 NOWPAYMENTS_API_KEY = os.environ.get("NOWPAYMENTS_API_KEY", "").strip()
@@ -708,7 +709,7 @@ async def create_oxapay_invoice(
         "email": email,
         "order_id": order_id,
         "description": f"ToolPipe {tier.title()} Plan",
-        "sandbox": False,
+        "sandbox": OXAPAY_SANDBOX,
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:

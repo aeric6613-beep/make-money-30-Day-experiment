@@ -22,6 +22,7 @@ class PaymentWebhookTests(unittest.TestCase):
             "PAYMENTS_DB": main.PAYMENTS_DB,
             "API_KEYS_DB": main.API_KEYS_DB,
             "OXAPAY_MERCHANT_KEY": main.OXAPAY_MERCHANT_KEY,
+            "OXAPAY_SANDBOX": main.OXAPAY_SANDBOX,
             "NOWPAYMENTS_API_KEY": main.NOWPAYMENTS_API_KEY,
             "NOWPAYMENTS_IPN_SECRET": main.NOWPAYMENTS_IPN_SECRET,
             "PAYMENTS_PUBLIC_BASE_URL": main.PAYMENTS_PUBLIC_BASE_URL,
@@ -140,6 +141,31 @@ class PaymentWebhookTests(unittest.TestCase):
                 (data["order_id"],),
             ).fetchone()
         self.assertEqual(row, ("oxapay", "pending", 9.99))
+
+    def test_create_payment_requests_sandbox_oxapay_invoice_when_enabled(self):
+        main.OXAPAY_SANDBOX = True
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": 200,
+            "data": {
+                "track_id": "oxapay-sandbox-track",
+                "payment_url": "https://pay.oxapay.example/sandbox/1",
+            },
+        }
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        client.post = AsyncMock(return_value=response)
+
+        with patch("main.httpx.AsyncClient", return_value=client):
+            result = self.client.post(
+                "/payments/create",
+                json={"email": "sandbox@example.test", "tier": "pro"},
+            )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(client.post.await_args.kwargs["json"]["sandbox"])
 
     def test_create_payment_rejects_non_https_callback_origin(self):
         main.PAYMENTS_PUBLIC_BASE_URL = "http://payments.example.test"
